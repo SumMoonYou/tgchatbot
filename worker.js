@@ -169,12 +169,22 @@ async function handlePrivate(msg, env, ctx) {
     if (isVerified) {
       return await tgCall(env, "sendMessage", { 
         chat_id: userId, 
-        text: "✅ <b>验证已生效</b>\n您现在可以直接发送消息、图片或文件，客服看到后会第一时间回复您。", 
+        text: "✅ <b>验证已生效</b>\n您现在可以直接发送消息，管理员看到后会第一时间回复您。", 
         parse_mode: "HTML" 
       });
     }
 
     // 状态 C：新用户（发起验证挑战）
+    // 先检查是否已有正在进行的验证
+    const activeChallengeId = await env.TOPIC_MAP.get(`user_chal:${userId}`);
+    if (activeChallengeId) {
+      return await tgCall(env, "sendMessage", { 
+        chat_id: userId, 
+        text: "⚠️ <b>您仍有未完成的验证</b>\n请向上滚动回答刚才的问题，或等待 5 分钟失效后再试。", 
+        parse_mode: "HTML" 
+      });
+    }
+
     return await sendChallenge(userId, env);
   }
 
@@ -185,14 +195,29 @@ async function handlePrivate(msg, env, ctx) {
   // 3. 专属话题管理：确保用户在群组中有对应的 Thread
   let rec = await env.TOPIC_MAP.get(`u:${userId}`, { type: "json" });
   if (!rec) {
-    const name = [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || `用户_${userId}`;
-    const res = await tgCall(env, "createForumTopic", { chat_id: env.SUPERGROUP_ID, name: `${name.substring(0, 15)}` });
-    if (res.ok) {
-      rec = { thread_id: res.result.message_thread_id.toString() };
-      await env.TOPIC_MAP.put(`u:${userId}`, JSON.stringify(rec));      // 用户ID -> 话题ID
-      await env.TOPIC_MAP.put(`t:${rec.thread_id}`, userId.toString()); // 话题ID -> 用户ID
-    }
-  }
+      // 用户显示名
+      const displayName = [msg.from.first_name, msg.from.last_name]
+          .filter(Boolean)
+          .join(" ")
+          .replace(/[<>]/g, "") || "用户";
+  
+      // username（可选）
+      const uname = msg.from.username ? ` @${msg.from.username}` : "";
+  
+      // 构建话题名：显示名 + username（如果有） + | + 用户ID
+      const topicName = `${displayName}${uname} | ${userId}`.substring(0, 60); // 防止过长
+  
+      const res = await tgCall(env, "createForumTopic", { 
+          chat_id: env.SUPERGROUP_ID, 
+          name: topicName 
+      });
+  
+      if (res.ok) {
+          rec = { thread_id: res.result.message_thread_id.toString() };
+          await env.TOPIC_MAP.put(`u:${userId}`, JSON.stringify(rec));      // 用户ID -> 话题ID
+          await env.TOPIC_MAP.put(`t:${rec.thread_id}`, userId.toString()); // 话题ID -> 用户ID
+      }
+  }  
 
   // --- 4. 关键改进：人为制造发送间隔 ---
   // 产生 500ms 到 2500ms 的随机延迟，用于打散多图连发（Media Group）的并发请求
@@ -234,7 +259,7 @@ async function triggerNotification(from, userThreadId, env, preview, lastId) {
   // 获取汇总话题 ID，不存在则初始化
   let todoId = await env.TOPIC_MAP.get("sys:todo_id");
   if (!todoId) {
-    const res = await tgCall(env, "createForumTopic", { chat_id: env.SUPERGROUP_ID, name: "📬 新消息汇总" });
+    const res = await tgCall(env, "createForumTopic", { chat_id: env.SUPERGROUP_ID, name: "📬 新消息" });
     if (res.ok) { 
         todoId = res.result.message_thread_id.toString(); 
         await env.TOPIC_MAP.put("sys:todo_id", todoId); 
@@ -346,30 +371,39 @@ async function handleCallback(query, env) {
   // 处理验证题目点击
   else if (data.startsWith("v:")) {
     const [_, cid, ans] = data.split(":");
+    const userId = query.from.id; // 获取用户ID
     const correct = await env.TOPIC_MAP.get(`chal:${cid}`);
     
-    // 无论对错，题目一经点击立即从 KV 中销毁，防重试
+    // 无论对错，题目一经点击立即从 KV 中销毁
     await env.TOPIC_MAP.delete(`chal:${cid}`); 
+    await env.TOPIC_MAP.delete(`user_chal:${userId}`); // 关键：删除用户的锁定状态
 
     if (correct && ans === correct) {
       await env.TOPIC_MAP.put(`v:${query.from.id}`, "1", { expirationTtl: 2592000 }); // 验证有效期 30 天
       await tgCall(env, "editMessageText", { chat_id: query.from.id, message_id: query.message.message_id, text: "✅ <b>验证通过！</b>", parse_mode: "HTML" });
     } else {
       await tgCall(env, "answerCallbackQuery", { callback_query_id: query.id, text: "❌ 验证失败，请重新回答", show_alert: true });
-      await sendChallenge(query.from.id, env, query.message.message_id); // 刷新题目
+      // 失败后刷新题目，sendChallenge 会重新生成 user_chal 绑定
+      await sendChallenge(userId, env, query.message.message_id); 
     }
   }
 }
 
 /**
- * 发送/刷新数学验证题
+ * 发送/刷新验证题
  */
 async function sendChallenge(uid, env, editId = null) {
   const quiz = QUESTION_BANK[Math.floor(Math.random() * QUESTION_BANK.length)];
   const id = Math.random().toString(36).substring(2, 10);
+  
+  // 1. 存储挑战内容 (有效期 300秒)
   await env.TOPIC_MAP.put(`chal:${id}`, quiz.answer, { expirationTtl: 300 });
+  // 2. 存储用户当前正在进行的挑战 ID (用于防止重复触发)
+  await env.TOPIC_MAP.put(`user_chal:${uid}`, id, { expirationTtl: 300 });
+
   const kb = { inline_keyboard: [quiz.options.map(o => ({ text: o, callback_data: `v:${id}:${o}` }))] };
   const text = `🛡 <b>身份验证</b>\n请选择正确答案以继续：\n\n问题：<b>${quiz.question}</b>`;
+  
   if (editId) await tgCall(env, "editMessageText", { chat_id: uid, message_id: editId, text, parse_mode: "HTML", reply_markup: kb });
   else await tgCall(env, "sendMessage", { chat_id: uid, text, parse_mode: "HTML", reply_markup: kb });
 }
