@@ -143,22 +143,42 @@ async function handlePrivate(msg, env, ctx) {
   const userId = msg.chat.id;
   const isAdmin = env.ADMIN_ID && String(userId) === String(env.ADMIN_ID);
 
-  // 1. 管理员拦截：防止管理员在机器人私聊窗口自言自语
+  // 1. 管理员逻辑保持不变
   if (isAdmin) {
     if (msg.text === "/start") {
-      return await tgCall(env, "sendMessage", { chat_id: userId, text: "🔧 <b>管理模式已激活</b>\n请前往客服群处理用户消息。", parse_mode: "HTML" });
+      return await tgCall(env, "sendMessage", { chat_id: userId, text: "🔧 <b>管理模式已激活</b>\n请前往群里面处理用户消息。", parse_mode: "HTML" });
+    }else{
+      return await tgCall(env, "sendMessage", { chat_id: userId, text: "请勿在此发消息，如需处理请前往群里面。", parse_mode: "HTML" });
     }
-    const adminTip = await tgCall(env, "sendMessage", { chat_id: userId, text: "⚠️ 管理员请勿在此发送咨询消息。", parse_mode: "HTML" });
-    if (adminTip.ok) {
-      ctx.waitUntil((async () => { 
-        await new Promise(r => setTimeout(r, 2000)); // 2秒后删除
-        await tgCall(env, "deleteMessage", { chat_id: userId, message_id: adminTip.result.message_id }); 
-      })());
-    }
-    return;
   }
 
-  // 2. 权限校验：黑名单检查 & 身份验证检查
+  // 2. 处理普通用户的 /start 指令
+  if (msg.text === "/start") {
+    // 状态 A：黑名单
+    const isBanned = await env.TOPIC_MAP.get(`ban:${userId}`);
+    if (isBanned) {
+      return await tgCall(env, "sendMessage", { 
+        chat_id: userId, 
+        text: "🚫 <b>系统提示</b>\n您的账号已被禁止咨询，请联系管理员。", 
+        parse_mode: "HTML" 
+      });
+    }
+
+    // 状态 B：已验证用户
+    const isVerified = await env.TOPIC_MAP.get(`v:${userId}`);
+    if (isVerified) {
+      return await tgCall(env, "sendMessage", { 
+        chat_id: userId, 
+        text: "✅ <b>验证已生效</b>\n您现在可以直接发送消息、图片或文件，客服看到后会第一时间回复您。", 
+        parse_mode: "HTML" 
+      });
+    }
+
+    // 状态 C：新用户（发起验证挑战）
+    return await sendChallenge(userId, env);
+  }
+
+  // 正常消息处理流程（验证拦截等）
   if (await env.TOPIC_MAP.get(`ban:${userId}`)) return; 
   if (!(await env.TOPIC_MAP.get(`v:${userId}`))) return await sendChallenge(userId, env);
 
@@ -365,12 +385,35 @@ function getPreview(msg) {
 }
 
 /**
- * 辅助：注册 Webhook (上线前需访问一次此路径)
+ * 辅助：注册 Webhook 及配置菜单指令
  */
 async function handleRegisterWebhook(request, env) {
   const domain = `https://${new URL(request.url).hostname}`;
-  await tgCall(env, "setWebhook", { url: domain, allowed_updates: ["message", "callback_query"] });
-  return new Response("Webhook OK - Bot is Active");
+  
+  // 1. 注册 Webhook
+  await tgCall(env, "setWebhook", { 
+    url: domain, 
+    allowed_updates: ["message", "callback_query"] 
+  });
+
+  // 2. 配置用户端私聊指令菜单 (仅显示 /start)
+  await tgCall(env, "setMyCommands", {
+    scope: { type: "all_private_chats" },
+    commands: [
+      { command: "start", description: "开始咨询 / 激活机器人" }
+    ]
+  });
+
+  // 3. 配置群组内管理指令菜单 (可选，方便管理员操作)
+  await tgCall(env, "setMyCommands", {
+    scope: { type: "all_group_chats" },
+    commands: [
+      { command: "ban", description: "封禁当前话题用户" },
+      { command: "unban", description: "解封当前话题用户" }
+    ]
+  });
+
+  return new Response("Webhook & Commands Updated - Bot is Active");
 }
 
 /**
