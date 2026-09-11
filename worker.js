@@ -1,29 +1,45 @@
 // ============================================================
-// Telegram 双向私聊机器人 (Cloudflare Worker 优化版)
+// Telegram 双向私聊机器人
+// Cloudflare Worker - 无 Durable Object 版本
+//
 // 功能：
 //   用户私聊 → 群组话题转发
 //   管理员回复 → 私聊回传
-// 特性：
-//   - 验证题防刷
-//   - 封禁 / 解封
-//   - 结案 (/close)
-//   - 彻底删除话题 (/delete)
-//   - 通知卡片 + 用户资料卡片
-// 优化点：
-//   1. 用户状态合并为单个 key (us:{uid})，大幅减少 KV 读写
-//   2. 短路读取，按优先级检查
-//   3. 减少不必要写入（验证有效期智能刷新、提示限流、通知节流）
-//   4. 提供 /cleanup 清理旧版残留 key
-//   5. /close 和 /delete 会彻底删除用户状态（用户下次需重新验证）
-//   6. /close 和 /delete 时自动删除未处理的通知卡片
-//   7. 用户首次消息时，资料卡片会稳定出现在话题最顶部
+//
+// 验证规则：
+//   连续答错 3 次 → 禁止 30 分钟
+//
+// 并发修复：
+//   1. Worker 内存 Promise 锁
+//   2. 用户 topic 创建占位
+//   3. topic 创建后二次确认
+//   4. 📬 新消息汇总话题独立锁
+//   5. 通知卡片状态重新读取
+//   6. /close /delete 与用户消息共用用户锁
+//   7. 删除失败时保留用户状态
+//   8. 验证题状态统一使用用户锁
+//
+// 不需要：
+//   BOT_LOCK
+//   Durable Object
+//   新 Binding
+//
+// 环境变量：
+//   BOT_TOKEN
+//   SUPERGROUP_ID
+//   ADMIN_ID
+//   CLEANUP_SECRET
+//   TOPIC_MAP
 // ============================================================
 
-// ------------------------------------------------------------
+
+// ============================================================
 // 1. 验证题库
-// ------------------------------------------------------------
+// ============================================================
+
 const QUESTION_BANK = [
-  // 数学问题
+
+  // 数学
   { question: "5 + 5 = ?", options: ["10", "15", "8"], answer: "10" },
   { question: "3 * 3 = ?", options: ["6", "9", "12"], answer: "9" },
   { question: "15 - 5 = ?", options: ["10", "5", "12"], answer: "10" },
@@ -46,7 +62,7 @@ const QUESTION_BANK = [
   { question: "牛奶的主要成分是什么？", options: ["水", "糖", "脂肪"], answer: "水" },
   { question: "空气的主要成分是什么？", options: ["氮气", "氧气", "二氧化碳"], answer: "氮气" },
 
-  // 交通规则
+  // 交通
   { question: "红灯停，什么灯行？", options: ["绿灯", "黄灯", "蓝灯"], answer: "绿灯" },
   { question: "行驶中，遇到红灯时应该怎么办？", options: ["停车等待", "加速通过", "按喇叭"], answer: "停车等待" },
   { question: "在高速公路上，最大车速是多少？", options: ["120公里/小时", "100公里/小时", "80公里/小时"], answer: "120公里/小时" },
@@ -58,7 +74,7 @@ const QUESTION_BANK = [
   { question: "如果警察示意停车，应该怎么做？", options: ["停车", "继续行驶", "按喇叭"], answer: "停车" },
   { question: "在没有交通标志的路口，应该怎样行驶？", options: ["优先通行", "等候他车通过", "加速通过"], answer: "等候他车通过" },
 
-  // 地理问题
+  // 地理
   { question: "太阳系中最小的行星是什么？", options: ["水星", "火星", "金星"], answer: "水星" },
   { question: "地球上最大的岛屿是哪个？", options: ["格陵兰岛", "新几内亚岛", "马尔代夫"], answer: "格陵兰岛" },
   { question: "世界上最深的海洋是哪个？", options: ["太平洋", "印度洋", "大西洋"], answer: "太平洋" },
@@ -67,1003 +83,3436 @@ const QUESTION_BANK = [
   { question: "月亮离地球有多远？", options: ["38万公里", "40万公里", "39万公里"], answer: "38万公里" },
   { question: "地球上最常见的气体是什么？", options: ["氮气", "氧气", "二氧化碳"], answer: "氮气" },
   { question: "地球的直径大约是多少公里？", options: ["12742公里", "12000公里", "14000公里"], answer: "12742公里" },
-  { question: "地球上有多少个大洋？", options: ["5个", "4个", "6个"], answer: "5个" },
-  { question: "地球的最大海洋是什么？", options: ["太平洋", "大西洋", "印度洋"], answer: "太平洋" },
 
-  // 科学常识
-  { question: "光速大约是多少？", options: ["30万公里/秒", "20万公里/秒", "10万公里/秒"], answer: "30万公里/秒" },
-  { question: "声音在空气中的传播速度大约是多少？", options: ["340米/秒", "100米/秒", "1000米/秒"], answer: "340米/秒" },
-  { question: "植物通过什么作用制造氧气？", options: ["光合作用", "呼吸作用", "蒸腾作用"], answer: "光合作用" },
-  { question: "指南针的 N 极指向哪个方向？", options: ["北方", "南方", "西方"], answer: "北方" },
-  { question: "干冰是哪种气体的固体形态？", options: ["二氧化碳", "氧气", "氢气"], answer: "二氧化碳" },
-  { question: "电灯泡是谁发明的？", options: ["爱迪生", "贝尔", "特斯拉"], answer: "爱迪生" },
-  { question: "钻石的主要成分是什么元素？", options: ["碳", "硅", "硫"], answer: "碳" },
-  { question: "人体最大的器官是什么？", options: ["皮肤", "肝脏", "肺"], answer: "皮肤" },
-  { question: "哪种金属在常温下是液态的？", options: ["汞（水银）", "铝", "铜"], answer: "汞（水银）" },
-  { question: "酸雨主要是由哪种气体引起的？", options: ["二氧化硫", "氧气", "氮气"], answer: "二氧化硫" },
+  // 更多常识
+  { question: "太阳从哪个方向升起？", options: ["东方", "西方", "南方"], answer: "东方" },
+  { question: "一年通常有多少个月？", options: ["12个月", "10个月", "14个月"], answer: "12个月" },
+  { question: "一周有多少天？", options: ["7天", "5天", "10天"], answer: "7天" },
+  { question: "一天有多少小时？", options: ["24小时", "12小时", "48小时"], answer: "24小时" },
+  { question: "一个小时有多少分钟？", options: ["60分钟", "30分钟", "100分钟"], answer: "60分钟" },
+  { question: "一个成年人通常有多少颗牙齿？", options: ["32颗", "28颗", "36颗"], answer: "32颗" },
+  { question: "人类通常用什么器官呼吸？", options: ["肺", "胃", "肝脏"], answer: "肺" },
+  { question: "人体最大的器官是什么？", options: ["皮肤", "心脏", "肝脏"], answer: "皮肤" },
+  { question: "植物进行光合作用主要需要什么？", options: ["阳光", "月光", "火光"], answer: "阳光" },
+  { question: "地球围绕什么运行？", options: ["太阳", "月亮", "火星"], answer: "太阳" },
 
-  // 历史文化
-  { question: "四大发明不包括哪一项？", options: ["电报", "造纸术", "火药"], answer: "电报" },
-  { question: "《西游记》中的唐僧共有几个徒弟？", options: ["3个", "4个", "2个"], answer: "3个" },
-  { question: "“床前明月光”的下一句是什么？", options: ["疑是地上霜", "举头望明月", "低头思故乡"], answer: "疑是地上霜" },
-  { question: "战国七雄不包括以下哪个国家？", options: ["晋国", "秦国", "齐国"], answer: "晋国" },
-  { question: "万里长城的主要功能是什么？", options: ["军事防御", "交通运输", "旅游观光"], answer: "军事防御" },
-  { question: "中国历史上第一个皇帝是谁？", options: ["秦始皇", "汉武帝", "唐太宗"], answer: "秦始皇" },
-  { question: "奥林匹克发源于哪个国家？", options: ["希腊", "意大利", "美国"], answer: "希腊" },
-  { question: "文艺复兴时期的《蒙娜丽莎》是谁的作品？", options: ["达芬奇", "梵高", "毕加索"], answer: "达芬奇" },
-  { question: "被称为“乐圣”的音乐家是谁？", options: ["贝多芬", "莫扎特", "肖邦"], answer: "贝多芬" },
-  { question: "莎士比亚是哪国的文学家？", options: ["英国", "法国", "德国"], answer: "英国" },
+  { question: "中国的首都是哪里？", options: ["北京", "上海", "广州"], answer: "北京" },
+  { question: "日本的首都是哪里？", options: ["东京", "大阪", "京都"], answer: "东京" },
+  { question: "法国的首都是哪里？", options: ["巴黎", "伦敦", "罗马"], answer: "巴黎" },
+  { question: "英国的首都是哪里？", options: ["伦敦", "巴黎", "柏林"], answer: "伦敦" },
+  { question: "美国的首都是哪里？", options: ["华盛顿", "纽约", "洛杉矶"], answer: "华盛顿" },
 
-  // 生物与自然
-  { question: "企鹅主要生活在地球的哪一端？", options: ["南极", "北极", "赤道"], answer: "南极" },
-  { question: "世界上跑得最快的陆地动物是什么？", options: ["猎豹", "狮子", "羚羊"], answer: "猎豹" },
-  { question: "哪种动物被称为“沙漠之舟”？", options: ["骆驼", "马", "驴"], answer: "骆驼" },
-  { question: "蝴蝶的一生不经历哪个阶段？", options: ["胎生", "幼虫", "蛹"], answer: "胎生" },
-  { question: "壁虎在遇到危险时会切断身体的哪个部位？", options: ["尾巴", "脚", "头"], answer: "尾巴" },
-  { question: "大熊猫最喜欢的食物是什么？", options: ["竹子", "苹果", "香蕉"], answer: "竹子" },
-  { question: "蝙蝠属于哪类动物？", options: ["哺乳动物", "鸟类", "爬行动物"], answer: "哺乳动物" },
-  { question: "世界上最高的树是什么？", options: ["红杉", "松树", "杨树"], answer: "红杉" },
-  { question: "蝉依靠什么发出声音？", options: ["腹部的鸣肌", "嘴巴", "翅膀摩擦"], answer: "腹部的鸣肌" },
-  { question: "哪种花被称为“花中之王”？", options: ["牡丹", "玫瑰", "荷花"], answer: "牡丹" },
+  { question: "苹果通常是什么颜色？", options: ["红色", "蓝色", "紫色"], answer: "红色" },
+  { question: "香蕉通常是什么颜色？", options: ["黄色", "黑色", "蓝色"], answer: "黄色" },
+  { question: "西瓜通常是什么颜色？", options: ["绿色", "紫色", "蓝色"], answer: "绿色" },
+  { question: "胡萝卜通常是什么颜色？", options: ["橙色", "蓝色", "紫色"], answer: "橙色" },
+  { question: "草通常是什么颜色？", options: ["绿色", "红色", "黑色"], answer: "绿色" },
 
-  // 逻辑与趣味
-  { question: "1斤棉花和1斤铁哪个重？", options: ["一样重", "铁重", "棉花重"], answer: "一样重" },
-  { question: "3个苹果，你拿走了2个，你现在有几个苹果？", options: ["2个", "1个", "3个"], answer: "2个" },
-  { question: "一个正方形有4个角，切掉1个角还剩几个角？", options: ["5个", "3个", "4个"], answer: "5个" },
-  { question: "冰变成水后，体积会发生什么变化？", options: ["变小", "变大", "不变"], answer: "变小" },
-  { question: "24小时内，时针绕表盘转几圈？", options: ["2圈", "1圈", "24圈"], answer: "2圈" },
-  { question: "如果今天星期五，那么3天后是星期几？", options: ["星期一", "星期日", "星期二"], answer: "星期一" },
-  { question: "世界上最小的鸟是什么鸟？", options: ["蜂鸟", "麻雀", "燕子"], answer: "蜂鸟" },
-  { question: "哪个月份天数最少？", options: ["2月", "1月", "4月"], answer: "2月" },
-  { question: "人的脊椎骨共有多少块？", options: ["26块", "33块", "24块"], answer: "26块" },
-  { question: "彩虹从外到内第一种颜色是什么？", options: ["红色", "紫色", "绿色"], answer: "红色" }
+  { question: "猫通常有几条腿？", options: ["4条", "2条", "6条"], answer: "4条" },
+  { question: "狗通常有几条腿？", options: ["4条", "3条", "6条"], answer: "4条" },
+  { question: "蜘蛛通常有几条腿？", options: ["8条", "6条", "10条"], answer: "8条" },
+  { question: "昆虫通常有几条腿？", options: ["6条", "8条", "4条"], answer: "6条" },
+
+  { question: "一年中有多少个月份至少有28天？", options: ["12个月", "1个月", "6个月"], answer: "12个月" },
+  { question: "1公斤等于多少克？", options: ["1000克", "100克", "500克"], answer: "1000克" },
+  { question: "1米等于多少厘米？", options: ["100厘米", "10厘米", "1000厘米"], answer: "100厘米" },
+  { question: "1小时等于多少秒？", options: ["3600秒", "600秒", "1800秒"], answer: "3600秒" },
+  { question: "三角形有几个角？", options: ["3个", "4个", "2个"], answer: "3个" },
+  { question: "正方形有几个边？", options: ["4条", "3条", "5条"], answer: "4条" },
+  { question: "圆形有几个角？", options: ["0个", "1个", "4个"], answer: "0个" },
+  { question: "10的一半是多少？", options: ["5", "2", "10"], answer: "5" },
+  { question: "2的平方是多少？", options: ["4", "2", "6"], answer: "4" },
+
+  { question: "电脑常用的输入设备是什么？", options: ["键盘", "显示器", "音箱"], answer: "键盘" },
+  { question: "电脑显示画面的设备是什么？", options: ["显示器", "键盘", "鼠标"], answer: "显示器" },
+  { question: "手机通常使用什么网络？", options: ["移动通信网络", "电网", "水网"], answer: "移动通信网络" },
+  { question: "Wi-Fi主要用于什么？", options: ["无线网络连接", "充电", "拍照"], answer: "无线网络连接" },
+
+  { question: "水是什么状态时可以结冰？", options: ["低温", "高温", "常温"], answer: "低温" },
+  { question: "冰融化后变成什么？", options: ["水", "空气", "石头"], answer: "水" },
+  { question: "云主要由什么组成？", options: ["水滴和冰晶", "沙子", "烟雾"], answer: "水滴和冰晶" },
+  { question: "彩虹通常有几种颜色？", options: ["7种", "5种", "10种"], answer: "7种" },
+  { question: "夜晚天空中最常见的天体是什么？", options: ["星星", "太阳", "彩虹"], answer: "星星" },
+
+  { question: "鱼通常生活在哪里？", options: ["水中", "树上", "沙漠"], answer: "水中" },
+  { question: "鸟通常用什么飞行？", options: ["翅膀", "尾巴", "脚"], answer: "翅膀" },
+  { question: "马通常吃什么？", options: ["草", "鱼", "肉"], answer: "草" },
+  { question: "熊猫最喜欢吃什么？", options: ["竹子", "鱼", "肉"], answer: "竹子" },
+  { question: "蜜蜂通常采集什么？", options: ["花蜜", "石头", "沙子"], answer: "花蜜" },
+
+  { question: "火通常是什么颜色？", options: ["红色或橙色", "蓝色", "黑色"], answer: "红色或橙色" },
+  { question: "煤炭通常是什么颜色？", options: ["黑色", "白色", "黄色"], answer: "黑色" },
+  { question: "雪的主要成分是什么？", options: ["冰", "沙", "盐"], answer: "冰" },
+  { question: "海水为什么是咸的？", options: ["含有盐分", "含有糖", "含有油"], answer: "含有盐分" },
+
+  { question: "人体负责思考的主要器官是什么？", options: ["大脑", "心脏", "胃"], answer: "大脑" },
+  { question: "心脏的主要作用是什么？", options: ["泵血", "消化食物", "呼吸"], answer: "泵血" },
+  { question: "胃主要负责什么？", options: ["消化食物", "呼吸", "听声音"], answer: "消化食物" },
+  { question: "耳朵主要用于什么？", options: ["听声音", "看东西", "呼吸"], answer: "听声音" },
+  { question: "眼睛主要用于什么？", options: ["视觉", "听觉", "嗅觉"], answer: "视觉" }
 ];
 
-// ------------------------------------------------------------
-// 2. 消息模板
-// ------------------------------------------------------------
+
+// ============================================================
+// 2. 消息文本
+// ============================================================
+
 const MSG = {
-  ban: "🚫 <b>系统提示</b>\n您的账号已被禁止咨询！！！",
-  success: "✅ <b>验证已生效</b>\n您现在可以直接发送消息，管理员看到后会第一时间回复您。",
-  fail: "⚠️ <b>您仍有未完成的验证</b>\n请向上滚动回答刚才的问题，或等待 5 分钟失效后再试。",
-  tempban: "🚫 您因连续答错已被禁用，请 30 分钟后再试",
-  verified: "✨ <b>验证有效</b>\n您可以直接发送消息。",
-  noCmd: "💡 <b>提示</b>\n用户端不支持指令操作，请直接描述您的问题。",
-  closed: "🏁 咨询已结束，感谢支持。",
-  banned: "🚫 <b>用户已封禁</b>",
-  unbanned: "✅ <b>用户已解封</b>",
-  closedAdmin: "✅ <b>已结案并释放缓存</b>",
-  deleted: "🗑️ <b>话题已彻底删除（含所有消息）</b>",
-  deletedUser: "🏁 咨询话题已被管理员删除。",
-  adminStart: "🔧 <b>管理模式已激活</b>\n请前往群里面处理用户消息。",
-  adminHelp: "tg双向私聊机器人~",
-  adminNoMsg: "请勿在此发消息，如需处理请前往群里面。"
+
+  ban:
+    "🚫 <b>您已被管理员禁止咨询。</b>",
+
+  success:
+    "✅ <b>验证通过</b>\n\n您可以开始发送消息了。",
+
+  fail:
+    "⚠️ <b>您还有验证题未完成。</b>\n\n请点击上方按钮选择答案。",
+
+  tempban:
+    "🚫 <b>验证失败次数过多</b>\n\n您已被禁止操作 <b>30 分钟</b>，请稍后再试。",
+
+  verified:
+    "✅ <b>您已经验证过了。</b>\n\n验证有效期内可以直接发送消息。",
+
+  noCmd:
+    "ℹ️ 暂不支持该指令。",
+
+  closed:
+    "✅ <b>本次咨询已结束。</b>\n\n如需再次咨询，请发送 /start。",
+
+  banned:
+    "🚫 <b>已封禁该用户。</b>",
+
+  unbanned:
+    "✅ <b>已解除该用户封禁。</b>",
+
+  closedAdmin:
+    "✅ <b>该咨询已结案。</b>",
+
+  deleted:
+    "🗑️ <b>正在彻底删除该咨询话题及相关记录。</b>",
+
+  deletedUser:
+    "🗑️ <b>本次咨询记录正在删除。</b>",
+
+  adminStart:
+    "🤖 <b>客服机器人运行正常。</b>",
+
+  adminHelp:
+    "📖 <b>管理员指令</b>\n\n" +
+    "/ban - 封禁当前用户\n" +
+    "/unban - 解除封禁\n" +
+    "/close - 关闭当前咨询\n" +
+    "/delete - 删除当前咨询话题",
+
+  adminNoMsg:
+    "⚠️ 当前话题没有绑定用户。"
 };
 
-// ------------------------------------------------------------
-// 3. KV Key 设计（优化后仅保留必要 key）
-// ------------------------------------------------------------
+
+// ============================================================
+// 3. KV Key
+// ============================================================
+
 const KEY = {
-  user: (id) => `us:${id}`,   // 用户完整状态（一个用户一条记录）
-  thread: (id) => `t:${id}`,  // 话题 ID → 用户 ID（管理员回复时使用）
-  todoId: "sys:todo_id"       // “📬 新消息”汇总话题 ID
+
+  user: id =>
+    `us:${id}`,
+
+  thread: id =>
+    `t:${id}`,
+
+  todoId:
+    "sys:todo_id",
+
+  todoCreating:
+    "sys:todo_creating"
 };
 
-// 时间常量（单位：秒）
-const SEVEN_DAYS = 7 * 24 * 3600;   // 验证有效期
-const FIVE_MIN = 300;               // 验证题有效期
-const THIRTY_MIN = 1800;            // 临时封禁时间
-const TIP_TTL = 60;                 // “已发送”提示限流
-const NOTIFY_THROTTLE = 8;          // 通知卡片更新最小间隔
 
 // ============================================================
-// 4. 用户状态读写工具函数
+// 4. 常量
 // ============================================================
 
-/**
- * 读取用户完整状态
- */
-async function getState(env, uid) {
-  const data = await env.TOPIC_MAP.get(KEY.user(uid), { type: "json" });
-  return data || {};
+const SEVEN_DAYS =
+  7 * 24 * 3600;
+
+const FIVE_MIN =
+  300;
+
+// 验证错误达到 3 次
+// 立即封禁 30 分钟
+const THIRTY_MIN =
+  1800;
+
+const TIP_TTL =
+  60;
+
+const NOTIFY_THROTTLE =
+  8;
+
+const TOPIC_CREATING_TTL =
+  15;
+
+
+// ============================================================
+// 5. 工具函数
+// ============================================================
+
+const LOCAL_LOCKS =
+  new Map();
+
+
+function sleep(ms) {
+
+  return new Promise(
+    resolve =>
+      setTimeout(resolve, ms)
+  );
 }
 
-/**
- * 保存用户状态（自动清理已过期的临时字段）
- */
-async function saveState(env, uid, state) {
-  const now = Math.floor(Date.now() / 1000);
 
-  // 清理过期字段，减小存储体积
-  if (state.verifiedUntil && state.verifiedUntil < now) delete state.verifiedUntil;
-  if (state.tempbanUntil && state.tempbanUntil < now) delete state.tempbanUntil;
-  if (state.tipUntil && state.tipUntil < now) delete state.tipUntil;
-  if (state.chalUntil && state.chalUntil < now) {
-    delete state.chalId;
-    delete state.chalAnswer;
-    delete state.chalUntil;
-  }
-  if (state.wrong && (!state.tempbanUntil || state.tempbanUntil < now)) {
-    delete state.wrong;
-  }
-
-  await env.TOPIC_MAP.put(KEY.user(uid), JSON.stringify(state));
-}
-
-/**
- * 获取当前时间戳（秒）
- */
 function nowSec() {
-  return Math.floor(Date.now() / 1000);
+
+  return Math.floor(
+    Date.now() / 1000
+  );
 }
 
+
+function escapeHtml(str) {
+
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+
 // ============================================================
-// 5. Worker 入口
+// 6. Worker 内存锁
+//
+// 注意：
+// 只保证同一个 Worker isolate 内的并发。
+// Cloudflare 不同 isolate 之间仍然可能同时执行。
 // ============================================================
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
 
-    // 注册 Webhook 和命令菜单
-    if (url.pathname === "/registerWebhook") {
-      return await handleRegisterWebhook(request, env);
-    }
+async function withLocalLock(
+  key,
+  fn
+) {
 
-    // 清理旧版残留数据（需带密钥）
-    if (url.pathname === "/cleanup") {
-      return await handleCleanup(request, env);
-    }
+  const previous =
+    LOCAL_LOCKS.get(key) ||
+    Promise.resolve();
 
-    // 基础配置检查
-    if (!env.BOT_TOKEN || !env.SUPERGROUP_ID || !env.TOPIC_MAP) {
-      return new Response("Config Error");
-    }
+  let release;
 
-    // 只处理 Telegram 的 POST 请求
-    if (request.method !== "POST") return new Response("OK");
-
-    let update;
-    try {
-      update = await request.json();
-    } catch {
-      return new Response("OK");
-    }
-
-    // 处理按钮回调
-    if (update.callback_query) {
-      await handleCallback(update.callback_query, env);
-      return new Response("OK");
-    }
-
-    const msg = update.message;
-    if (!msg) return new Response("OK");
-
-    // 私聊消息
-    if (msg.chat?.type === "private") {
-      ctx.waitUntil(handlePrivate(msg, env, ctx));
-    }
-    // 超级群话题消息
-    else if (String(msg.chat?.id) === String(env.SUPERGROUP_ID)) {
-      if (msg.message_thread_id) {
-        ctx.waitUntil(handleAdminReply(msg, env, ctx));
+  const current =
+    new Promise(
+      resolve => {
+        release = resolve;
       }
-    }
-
-    return new Response("OK");
-  }
-};
-
-// ============================================================
-// 6. 处理用户私聊消息
-// ============================================================
-async function handlePrivate(msg, env, ctx) {
-  const userId = msg.chat.id;
-  const isAdmin = env.ADMIN_ID && String(userId) === String(env.ADMIN_ID);
-
-  // ---------- 管理员私聊特殊处理 ----------
-  if (isAdmin) {
-    if (msg.text === "/start") {
-      return tgCall(env, "sendMessage", {
-        chat_id: userId,
-        text: MSG.adminStart,
-        parse_mode: "HTML"
-      });
-    }
-    if (msg.text === "/help") {
-      return tgCall(env, "sendMessage", {
-        chat_id: userId,
-        text: MSG.adminHelp,
-        parse_mode: "HTML"
-      });
-    }
-    return tgCall(env, "sendMessage", {
-      chat_id: userId,
-      text: MSG.adminNoMsg,
-      parse_mode: "HTML"
-    });
-  }
-
-  // ---------- 一次读取完整用户状态（核心优化） ----------
-  let state = await getState(env, userId);
-  const now = nowSec();
-
-  // 1. 永久封禁检查（最高优先级）
-  if (state.ban) {
-    return tgCall(env, "sendMessage", {
-      chat_id: userId,
-      text: MSG.ban,
-      parse_mode: "HTML"
-    });
-  }
-
-  // 2. 临时封禁检查
-  if (state.tempbanUntil && state.tempbanUntil > now) {
-    return tgCall(env, "sendMessage", {
-      chat_id: userId,
-      text: MSG.tempban,
-      parse_mode: "HTML"
-    });
-  }
-
-  // ---------- /start 指令 ----------
-  if (msg.text === "/start") {
-    if (state.verifiedUntil && state.verifiedUntil > now) {
-      return tgCall(env, "sendMessage", {
-        chat_id: userId,
-        text: MSG.success,
-        parse_mode: "HTML"
-      });
-    }
-    if (state.chalId && state.chalUntil > now) {
-      return tgCall(env, "sendMessage", {
-        chat_id: userId,
-        text: MSG.fail,
-        parse_mode: "HTML"
-      });
-    }
-    return sendChallenge(userId, env, state);
-  }
-
-  // 3. 未验证用户强制验证
-  if (!state.verifiedUntil || state.verifiedUntil <= now) {
-    return sendChallenge(userId, env, state);
-  }
-
-  // ---------- 确保用户已有对应话题 ----------
-  if (!state.thread_id) {
-    const displayName = [msg.from.first_name, msg.from.last_name]
-      .filter(Boolean)
-      .join(" ")
-      .replace(/[<>]/g, "") || "用户";
-    const uname = msg.from.username ? ` @${msg.from.username}` : "";
-    const topicName = `${displayName}${uname} | ${userId}`.substring(0, 60);
-
-    // 创建论坛话题
-    const res = await tgCall(env, "createForumTopic", {
-      chat_id: env.SUPERGROUP_ID,
-      name: topicName
-    });
-
-    if (!res.ok) return; // 创建失败直接退出
-
-    state.thread_id = res.result.message_thread_id.toString();
-    state.original_name = topicName;
-
-    // 写入用户状态 + 反向映射
-    await Promise.all([
-      saveState(env, userId, state),
-      env.TOPIC_MAP.put(KEY.thread(state.thread_id), userId.toString())
-    ]);
-
-    // 等待资料卡片发送完成，确保它排在话题最顶部
-    await sendUserProfileCard(msg.from, state.thread_id, env, topicName);
-  }
-
-  // 媒体组消息轻微延迟，防止顺序错乱
-  if (msg.media_group_id) {
-    await new Promise(r => setTimeout(r, 300 + Math.floor(Math.random() * 1200)));
-  }
-
-  // 转发用户消息到对应话题
-  const fRes = await sendBot(msg, env.SUPERGROUP_ID, state.thread_id, env);
-
-  if (fRes.ok) {
-    // 更新通知卡片（带节流）
-    ctx.waitUntil(
-      triggerNotification(msg.from, state.thread_id, env, getPreview(msg), fRes.result.message_id, state)
     );
 
-    // “已发送”提示限流（60秒内只提示一次）
-    if (!state.tipUntil || state.tipUntil <= now) {
-      state.tipUntil = now + TIP_TTL;
-      await saveState(env, userId, state);
+  const chain =
+    previous
+      .catch(() => {})
+      .then(() => current);
 
-      const tipRes = await tgCall(env, "sendMessage", {
+  LOCAL_LOCKS.set(
+    key,
+    chain
+  );
+
+  await previous.catch(
+    () => {}
+  );
+
+  try {
+
+    return await fn();
+
+  } finally {
+
+    release();
+
+    if (
+      LOCAL_LOCKS.get(key) ===
+      chain
+    ) {
+      LOCAL_LOCKS.delete(key);
+    }
+  }
+}
+
+
+// ============================================================
+// 7. KV 状态
+// ============================================================
+
+async function getState(
+  env,
+  uid
+) {
+
+  return (
+    await env.TOPIC_MAP.get(
+      KEY.user(uid),
+      { type: "json" }
+    )
+  ) || {};
+}
+
+
+async function saveState(
+  env,
+  uid,
+  state
+) {
+
+  const copy = {
+    ...state
+  };
+
+  const now =
+    nowSec();
+
+  // 清理已经过期的验证状态
+  if (
+    copy.verifiedUntil &&
+    copy.verifiedUntil <= now
+  ) {
+    delete copy.verifiedUntil;
+  }
+
+  // 清理已经过期的临时封禁
+  if (
+    copy.tempbanUntil &&
+    copy.tempbanUntil <= now
+  ) {
+    delete copy.tempbanUntil;
+  }
+
+  // 清理已经过期的挑战
+  if (
+    copy.chalUntil &&
+    copy.chalUntil <= now
+  ) {
+    delete copy.chalId;
+    delete copy.chalAnswer;
+    delete copy.chalUntil;
+  }
+
+  // 没有临时封禁时，错误次数可以保留
+  // 但挑战已经过期时不保留挑战字段
+  if (
+    copy.wrong &&
+    copy.wrong < 0
+  ) {
+    delete copy.wrong;
+  }
+
+  await env.TOPIC_MAP.put(
+    KEY.user(uid),
+    JSON.stringify(copy)
+  );
+
+  return copy;
+}
+
+
+// ============================================================
+// 8. 主入口
+// ============================================================
+
+export default {
+
+  async fetch(
+    request,
+    env,
+    ctx
+  ) {
+
+    const url =
+      new URL(request.url);
+
+    // 注册 Webhook
+    if (
+      url.pathname ===
+      "/registerWebhook"
+    ) {
+      return handleRegisterWebhook(
+        request,
+        env
+      );
+    }
+
+    // 清理旧 KV
+    if (
+      url.pathname ===
+      "/cleanup"
+    ) {
+      return handleCleanup(
+        request,
+        env
+      );
+    }
+
+    if (
+      request.method !==
+      "POST"
+    ) {
+      return new Response(
+        "OK"
+      );
+    }
+
+    let update;
+
+    try {
+
+      update =
+        await request.json();
+
+    } catch {
+
+      return new Response(
+        "Bad Request",
+        { status: 400 }
+      );
+    }
+
+    // Callback
+    if (
+      update.callback_query
+    ) {
+
+      ctx.waitUntil(
+        handleCallback(
+          update.callback_query,
+          env
+        )
+      );
+
+      return new Response(
+        "OK"
+      );
+    }
+
+    const msg =
+      update.message;
+
+    if (!msg) {
+
+      return new Response(
+        "OK"
+      );
+    }
+
+    // 私聊
+    if (
+      msg.chat?.type ===
+        "private"
+    ) {
+
+      ctx.waitUntil(
+        handlePrivate(
+          msg,
+          env,
+          ctx
+        )
+      );
+
+      return new Response(
+        "OK"
+      );
+    }
+
+    // 群组
+    if (
+      msg.chat?.id != null &&
+      String(msg.chat.id) ===
+        String(env.SUPERGROUP_ID) &&
+      msg.message_thread_id
+    ) {
+
+      ctx.waitUntil(
+        handleAdminReply(
+          msg,
+          env,
+          ctx
+        )
+      );
+
+      return new Response(
+        "OK"
+      );
+    }
+
+    return new Response(
+      "OK"
+    );
+  }
+};
+
+
+// ============================================================
+// 9. 用户消息
+// ============================================================
+
+async function handlePrivate(
+  msg,
+  env,
+  ctx
+) {
+
+  const user =
+    msg.from;
+
+  if (!user) {
+    return;
+  }
+
+  const userId =
+    user.id;
+
+  let state =
+    await getState(
+      env,
+      userId
+    );
+
+  const now =
+    nowSec();
+
+  // 管理员私聊
+  if (
+    env.ADMIN_ID &&
+    String(userId) ===
+      String(env.ADMIN_ID)
+  ) {
+
+    if (
+      msg.text === "/start"
+    ) {
+
+      return tgCall(
+        env,
+        "sendMessage",
+        {
+          chat_id: userId,
+          text: MSG.adminStart,
+          parse_mode: "HTML"
+        }
+      );
+    }
+
+    return;
+  }
+
+  // 永久封禁
+  if (state.ban) {
+
+    return tgCall(
+      env,
+      "sendMessage",
+      {
         chat_id: userId,
-        text: "✅ <b>已发送</b>",
+        text: MSG.ban,
         parse_mode: "HTML"
-      });
+      }
+    );
+  }
+
+  // 临时封禁 30 分钟
+  if (
+    state.tempbanUntil &&
+    state.tempbanUntil > now
+  ) {
+
+    return tgCall(
+      env,
+      "sendMessage",
+      {
+        chat_id: userId,
+        text: MSG.tempban,
+        parse_mode: "HTML"
+      }
+    );
+  }
+
+  // /start
+  if (
+    msg.text === "/start"
+  ) {
+
+    if (
+      state.verifiedUntil &&
+      state.verifiedUntil > now
+    ) {
+
+      return tgCall(
+        env,
+        "sendMessage",
+        {
+          chat_id: userId,
+          text: MSG.verified,
+          parse_mode: "HTML"
+        }
+      );
+    }
+
+    if (
+      state.chalId &&
+      state.chalUntil &&
+      state.chalUntil > now
+    ) {
+
+      return tgCall(
+        env,
+        "sendMessage",
+        {
+          chat_id: userId,
+          text: MSG.fail,
+          parse_mode: "HTML"
+        }
+      );
+    }
+
+    return sendChallenge(
+      userId,
+      env
+    );
+  }
+
+  // 未验证
+  if (
+    !state.verifiedUntil ||
+    state.verifiedUntil <= now
+  ) {
+
+    return sendChallenge(
+      userId,
+      env
+    );
+  }
+
+  // 确保只有一个用户话题
+  const topic =
+    await ensureUserTopic(
+      msg,
+      env
+    );
+
+  if (!topic) {
+    return;
+  }
+
+  state =
+    topic.state;
+
+  const threadId =
+    topic.threadId;
+
+  // 记录当前会话版本
+  const sessionId =
+    state.sessionId;
+
+  // ----------------------------------------------------------
+  // 媒体组稍微延迟
+  // ----------------------------------------------------------
+
+  if (
+    msg.media_group_id
+  ) {
+
+    await sleep(
+      300 +
+      Math.floor(
+        Math.random() * 700
+      )
+    );
+  }
+
+  // ----------------------------------------------------------
+  // 再次读取最新状态
+  // 防止 /close /delete 在期间改变状态
+  // ----------------------------------------------------------
+
+  const latest =
+    await getState(
+      env,
+      userId
+    );
+
+  if (
+    !latest.thread_id ||
+    String(latest.thread_id) !==
+      String(threadId)
+  ) {
+    return;
+  }
+
+  // 会话版本变化，说明旧请求已经失效
+  if (
+    sessionId &&
+    latest.sessionId &&
+    sessionId !== latest.sessionId
+  ) {
+    return;
+  }
+
+  // 已被封禁
+  if (latest.ban) {
+    return;
+  }
+
+  if (
+    latest.tempbanUntil &&
+    latest.tempbanUntil > nowSec()
+  ) {
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // 转发用户消息
+  // ----------------------------------------------------------
+
+  const sent =
+    await sendBot(
+      msg,
+      env.SUPERGROUP_ID,
+      threadId,
+      env
+    );
+
+  if (!sent?.ok) {
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // 新消息通知
+  // ----------------------------------------------------------
+
+  ctx.waitUntil(
+    triggerNotification(
+      user,
+      threadId,
+      env,
+      getPreview(msg),
+      sent.result?.message_id
+    )
+  );
+
+  // ----------------------------------------------------------
+  // “已发送”提示
+  // ----------------------------------------------------------
+
+  await withLocalLock(
+    `user-state:${userId}`,
+    async () => {
+
+      const current =
+        await getState(
+          env,
+          userId
+        );
+
+      if (
+        !current.thread_id ||
+        String(current.thread_id) !==
+          String(threadId)
+      ) {
+        return;
+      }
+
+      current.tipUntil =
+        nowSec() + TIP_TTL;
+
+      await saveState(
+        env,
+        userId,
+        current
+      );
+
+      const tipRes =
+        await tgCall(
+          env,
+          "sendMessage",
+          {
+            chat_id: userId,
+            text:
+              "✅ <b>已发送</b>",
+            parse_mode: "HTML"
+          }
+        );
 
       if (tipRes.ok) {
-        // 2秒后自动删除提示
-        ctx.waitUntil((async () => {
-          await new Promise(r => setTimeout(r, 2000));
-          await tgCall(env, "deleteMessage", {
-            chat_id: userId,
-            message_id: tipRes.result.message_id
-          });
-        })());
+
+        ctx.waitUntil(
+          (async () => {
+
+            await sleep(2000);
+
+            await tgCall(
+              env,
+              "deleteMessage",
+              {
+                chat_id: userId,
+                message_id:
+                  tipRes.result.message_id
+              }
+            );
+
+          })()
+        );
       }
     }
-  }
+  );
 }
 
-// ============================================================
-// 7. 发送用户资料卡片（创建话题时）
-// ============================================================
-async function sendUserProfileCard(user, threadId, env, originalName = "") {
-  const chatId = env.SUPERGROUP_ID;
-  const displayName = [user.first_name, user.last_name].filter(Boolean).join(" ") || "用户";
-  const username = user.username ? `@${user.username}` : "无";
-  const userId = user.id;
 
-  let text = `📇 <b>用户资料卡片</b>\n\n`;
-  text += `👤 <b>昵称</b>: ${displayName}\n`;
-  text += `🆔 <b>ID</b>: <code>${userId}</code>\n`;
-  text += `🔗 <b>账号</b>: ${username}\n`;
-  text += `💬 <b>话题名</b>: ${originalName}\n`;
+// ============================================================
+// 10. 创建用户话题
+// ============================================================
 
-  // 尝试获取用户头像
-  let photoId = null;
-  try {
-    const res = await tgCall(env, "getUserProfilePhotos", { user_id: userId, limit: 1 });
-    if (res.ok && res.result.total_count > 0) {
-      const sizes = res.result.photos[0];
-      photoId = sizes[sizes.length - 1].file_id;
+async function ensureUserTopic(
+  msg,
+  env
+) {
+
+  const user =
+    msg.from;
+
+  const userId =
+    user.id;
+
+  return withLocalLock(
+    `user-topic:${userId}`,
+    async () => {
+
+      let state =
+        await getState(
+          env,
+          userId
+        );
+
+      // 已存在
+      if (
+        state.thread_id
+      ) {
+
+        return {
+          threadId:
+            String(
+              state.thread_id
+            ),
+          state
+        };
+      }
+
+      // ------------------------------------------------------
+      // 创建中的占位
+      // ------------------------------------------------------
+
+      if (
+        state.topicCreatingUntil &&
+        state.topicCreatingUntil >
+          nowSec()
+      ) {
+
+        const deadline =
+          Date.now() + 8000;
+
+        while (
+          Date.now() <
+          deadline
+        ) {
+
+          await sleep(300);
+
+          state =
+            await getState(
+              env,
+              userId
+            );
+
+          if (
+            state.thread_id
+          ) {
+
+            return {
+              threadId:
+                String(
+                  state.thread_id
+                ),
+              state
+            };
+          }
+
+          if (
+            !state.topicCreatingUntil ||
+            state.topicCreatingUntil <=
+              nowSec()
+          ) {
+            break;
+          }
+        }
+      }
+
+      // 再次读取
+      state =
+        await getState(
+          env,
+          userId
+        );
+
+      if (
+        state.thread_id
+      ) {
+
+        return {
+          threadId:
+            String(
+              state.thread_id
+            ),
+          state
+        };
+      }
+
+      // ------------------------------------------------------
+      // 写入创建占位
+      // ------------------------------------------------------
+
+      const creatingToken =
+        crypto.randomUUID();
+
+      state.topicCreatingUntil =
+        nowSec() + 15;
+
+      state.topicCreatingToken =
+        creatingToken;
+
+      await saveState(
+        env,
+        userId,
+        state
+      );
+
+      // ------------------------------------------------------
+      // 创建 Forum Topic
+      // ------------------------------------------------------
+
+      const displayName =
+        [
+          user.first_name,
+          user.last_name
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .trim() || "用户";
+
+      const topicName =
+        displayName
+          .substring(0, 120);
+
+      const res =
+        await tgCall(
+          env,
+          "createForumTopic",
+          {
+            chat_id:
+              env.SUPERGROUP_ID,
+            name:
+              topicName
+          }
+        );
+
+      // ------------------------------------------------------
+      // 创建失败
+      // ------------------------------------------------------
+
+      if (
+        !res.ok ||
+        !res.result?.message_thread_id
+      ) {
+
+        const latest =
+          await getState(
+            env,
+            userId
+          );
+
+        if (
+          latest.topicCreatingToken ===
+          creatingToken
+        ) {
+
+          delete latest.topicCreatingUntil;
+          delete latest.topicCreatingToken;
+
+          await saveState(
+            env,
+            userId,
+            latest
+          );
+        }
+
+        return null;
+      }
+
+      const newThreadId =
+        String(
+          res.result.message_thread_id
+        );
+
+      // ------------------------------------------------------
+      // 创建成功后二次读取
+      // ------------------------------------------------------
+
+      state =
+        await getState(
+          env,
+          userId
+        );
+
+      // 已经存在其他话题
+      if (
+        state.thread_id &&
+        String(state.thread_id) !==
+          newThreadId
+      ) {
+
+        await tgCall(
+          env,
+          "deleteForumTopic",
+          {
+            chat_id:
+              env.SUPERGROUP_ID,
+            message_thread_id:
+              Number(newThreadId)
+          }
+        );
+
+        return {
+          threadId:
+            String(
+              state.thread_id
+            ),
+          state
+        };
+      }
+
+      // ------------------------------------------------------
+      // 建立新会话
+      // ------------------------------------------------------
+
+      const sessionId =
+        crypto.randomUUID();
+
+      state.thread_id =
+        newThreadId;
+
+      state.sessionId =
+        sessionId;
+
+      state.original_name =
+        topicName;
+
+      delete state.topicCreatingUntil;
+      delete state.topicCreatingToken;
+
+      await saveState(
+        env,
+        userId,
+        state
+      );
+
+      // 反向映射
+      await env.TOPIC_MAP.put(
+        KEY.thread(newThreadId),
+        String(userId)
+      );
+
+      // 用户资料卡
+      await sendUserProfileCard(
+        user,
+        newThreadId,
+        env,
+        topicName
+      );
+
+      return {
+        threadId:
+          newThreadId,
+        state
+      };
     }
-  } catch (e) {}
+  );
+}
+
+
+// ============================================================
+// 11. 用户资料卡片
+// ============================================================
+
+async function sendUserProfileCard(
+  user,
+  threadId,
+  env,
+  originalName = ""
+) {
+
+  const chatId =
+    env.SUPERGROUP_ID;
+
+  const displayName =
+    [
+      user.first_name,
+      user.last_name
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim() || "用户";
+
+  const username =
+    user.username
+      ? `@${user.username}`
+      : "无";
+
+  const userId =
+    user.id;
+
+  let text =
+    "📇 <b>用户资料卡片</b>\n\n";
+
+  text +=
+    `👤 <b>昵称</b>: ${escapeHtml(displayName)}\n`;
+
+  text +=
+    `🆔 <b>ID</b>: <code>${userId}</code>\n`;
+
+  text +=
+    `🔗 <b>账号</b>: ${escapeHtml(username)}\n`;
+
+  text +=
+    `💬 <b>话题名</b>: ${escapeHtml(originalName)}\n`;
+
+  let photoId =
+    null;
+
+  try {
+
+    const res =
+      await tgCall(
+        env,
+        "getUserProfilePhotos",
+        {
+          user_id: userId,
+          limit: 1
+        }
+      );
+
+    if (
+      res.ok &&
+      res.result?.total_count > 0
+    ) {
+
+      const sizes =
+        res.result.photos[0];
+
+      photoId =
+        sizes[
+          sizes.length - 1
+        ].file_id;
+    }
+
+  } catch {}
 
   if (photoId) {
-    await tgCall(env, "sendPhoto", {
-      chat_id: chatId,
-      message_thread_id: Number(threadId),
-      photo: photoId,
-      caption: text,
-      parse_mode: "HTML"
-    });
+
+    await tgCall(
+      env,
+      "sendPhoto",
+      {
+        chat_id: chatId,
+        message_thread_id:
+          Number(threadId),
+        photo: photoId,
+        caption: text,
+        parse_mode: "HTML"
+      }
+    );
+
   } else {
-    await tgCall(env, "sendMessage", {
-      chat_id: chatId,
-      message_thread_id: Number(threadId),
-      text,
-      parse_mode: "HTML"
-    });
+
+    await tgCall(
+      env,
+      "sendMessage",
+      {
+        chat_id: chatId,
+        message_thread_id:
+          Number(threadId),
+        text,
+        parse_mode: "HTML"
+      }
+    );
   }
 }
 
+
 // ============================================================
-// 8. 汇总通知卡片（带节流）
+// 12. 📬 新消息汇总话题
 // ============================================================
-async function triggerNotification(from, userThreadId, env, preview, lastId, state) {
-  const userId = from.id;
-  const now = nowSec();
 
-  // 通知卡片更新节流
-  if (state.lastNotify && (now - state.lastNotify) < NOTIFY_THROTTLE) return;
+async function ensureTodoTopic(
+  env
+) {
 
-  // 轻微随机延迟，降低并发冲突
-  await new Promise(r => setTimeout(r, Math.floor(Math.random() * 300)));
+  return withLocalLock(
+    `todo-topic:${env.SUPERGROUP_ID}`,
+    async () => {
 
-  // 获取或创建“📬 新消息”汇总话题
-  let todoId = await env.TOPIC_MAP.get(KEY.todoId);
-  if (!todoId) {
-    const res = await tgCall(env, "createForumTopic", {
-      chat_id: env.SUPERGROUP_ID,
-      name: "📬 新消息"
-    });
-    if (res.ok) {
-      todoId = res.result.message_thread_id.toString();
-      await env.TOPIC_MAP.put(KEY.todoId, todoId);
+      let todoId =
+        await env.TOPIC_MAP.get(
+          KEY.todoId
+        );
+
+      if (todoId) {
+        return String(todoId);
+      }
+
+      let creating =
+        await env.TOPIC_MAP.get(
+          KEY.todoCreating,
+          { type: "json" }
+        );
+
+      if (
+        creating &&
+        creating.until &&
+        creating.until >
+          nowSec()
+      ) {
+
+        const deadline =
+          Date.now() + 8000;
+
+        while (
+          Date.now() <
+          deadline
+        ) {
+
+          await sleep(300);
+
+          todoId =
+            await env.TOPIC_MAP.get(
+              KEY.todoId
+            );
+
+          if (todoId) {
+            return String(todoId);
+          }
+
+          creating =
+            await env.TOPIC_MAP.get(
+              KEY.todoCreating,
+              { type: "json" }
+            );
+
+          if (
+            !creating ||
+            !creating.until ||
+            creating.until <=
+              nowSec()
+          ) {
+            break;
+          }
+        }
+      }
+
+      todoId =
+        await env.TOPIC_MAP.get(
+          KEY.todoId
+        );
+
+      if (todoId) {
+        return String(todoId);
+      }
+
+      const token =
+        crypto.randomUUID();
+
+      await env.TOPIC_MAP.put(
+        KEY.todoCreating,
+        JSON.stringify({
+          until:
+            nowSec() +
+            TOPIC_CREATING_TTL,
+          id: token
+        })
+      );
+
+      const res =
+        await tgCall(
+          env,
+          "createForumTopic",
+          {
+            chat_id:
+              env.SUPERGROUP_ID,
+            name:
+              "📬 新消息"
+          }
+        );
+
+      if (
+        !res.ok ||
+        !res.result?.message_thread_id
+      ) {
+
+        const latest =
+          await env.TOPIC_MAP.get(
+            KEY.todoCreating,
+            { type: "json" }
+          );
+
+        if (
+          latest?.id === token
+        ) {
+
+          await env.TOPIC_MAP.delete(
+            KEY.todoCreating
+          );
+        }
+
+        return null;
+      }
+
+      const newTodoId =
+        String(
+          res.result.message_thread_id
+        );
+
+      todoId =
+        await env.TOPIC_MAP.get(
+          KEY.todoId
+        );
+
+      if (
+        todoId &&
+        String(todoId) !==
+          newTodoId
+      ) {
+
+        await tgCall(
+          env,
+          "deleteForumTopic",
+          {
+            chat_id:
+              env.SUPERGROUP_ID,
+            message_thread_id:
+              Number(newTodoId)
+          }
+        );
+
+        return String(todoId);
+      }
+
+      await env.TOPIC_MAP.put(
+        KEY.todoId,
+        newTodoId
+      );
+
+      const latest =
+        await env.TOPIC_MAP.get(
+          KEY.todoCreating,
+          { type: "json" }
+        );
+
+      if (
+        latest?.id === token
+      ) {
+
+        await env.TOPIC_MAP.delete(
+          KEY.todoCreating
+        );
+      }
+
+      return newTodoId;
     }
+  );
+}
+
+
+// ============================================================
+// 13. 通知卡片
+// ============================================================
+
+async function triggerNotification(
+  from,
+  userThreadId,
+  env,
+  preview,
+  lastId
+) {
+
+  const userId =
+    from.id;
+
+  return withLocalLock(
+    `notify:${env.SUPERGROUP_ID}`,
+    async () => {
+
+      let state =
+        await getState(
+          env,
+          userId
+        );
+
+      if (
+        !state.thread_id ||
+        String(state.thread_id) !==
+          String(userThreadId)
+      ) {
+        return;
+      }
+
+      const sessionId =
+        state.sessionId;
+
+      const now =
+        nowSec();
+
+      if (
+        state.lastNotify &&
+        now -
+          state.lastNotify <
+          NOTIFY_THROTTLE
+      ) {
+        return;
+      }
+
+      let todoId =
+        await ensureTodoTopic(
+          env
+        );
+
+      if (!todoId) {
+        return;
+      }
+
+      const name =
+        [
+          from.first_name,
+          from.last_name
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .trim() || "用户";
+
+      const safeName =
+        escapeHtml(name);
+
+      const safePreview =
+        escapeHtml(preview);
+
+      let text =
+        "🎯 <b>新消息提醒</b>\n\n";
+
+      text +=
+        `👤 <b>用户</b>: ${safeName}\n`;
+
+      if (from.username) {
+
+        text +=
+          `🆔 <b>账号</b>: @${escapeHtml(from.username)}\n`;
+
+      } else {
+
+        text +=
+          `🆔 <b>ID</b>: <code>${userId}</code>\n`;
+      }
+
+      text +=
+        `💬 <b>内容</b>: ${safePreview}\n\n`;
+
+      const cardId =
+        state.card_id;
+
+      if (cardId) {
+
+        text +=
+          "🔔 状态: [追加消息]";
+
+      } else {
+
+        const adminMention =
+          env.ADMIN_ID
+            ? `<a href="tg://user?id=${env.ADMIN_ID}">@管理员</a>`
+            : "<b>管理员</b>";
+
+        text +=
+          `📢 呼叫 ${adminMention} [待处理]`;
+      }
+
+      const cleanId =
+        String(
+          env.SUPERGROUP_ID
+        ).replace(
+          "-100",
+          ""
+        );
+
+      const jumpUrl =
+        `https://t.me/c/${cleanId}/${lastId}?thread=${userThreadId}`;
+
+      const kb = {
+
+        inline_keyboard: [
+
+          [
+            {
+              text:
+                "🚀 跳转话题",
+              url:
+                jumpUrl
+            },
+
+            ...(from.username
+              ? [
+                  {
+                    text:
+                      "👤 资料",
+                    url:
+                      `https://t.me/${from.username}`
+                  }
+                ]
+              : [])
+          ],
+
+          [
+            {
+              text:
+                "🗑️ 忽略卡片",
+              callback_data:
+                `del:${userId}`
+            }
+          ]
+        ]
+      };
+
+      // ------------------------------------------------------
+      // 编辑旧卡片
+      // ------------------------------------------------------
+
+      if (cardId) {
+
+        const edit =
+          await tgCall(
+            env,
+            "editMessageText",
+            {
+              chat_id:
+                env.SUPERGROUP_ID,
+              message_id:
+                Number(cardId),
+              text,
+              parse_mode:
+                "HTML",
+              reply_markup:
+                kb
+            }
+          );
+
+        if (edit.ok) {
+
+          await withLocalLock(
+            `user-state:${userId}`,
+            async () => {
+
+              const latest =
+                await getState(
+                  env,
+                  userId
+                );
+
+              if (
+                !latest.thread_id ||
+                String(
+                  latest.thread_id
+                ) !==
+                  String(userThreadId)
+              ) {
+                return;
+              }
+
+              if (
+                sessionId &&
+                latest.sessionId &&
+                sessionId !==
+                  latest.sessionId
+              ) {
+                return;
+              }
+
+              latest.lastNotify =
+                now;
+
+              await saveState(
+                env,
+                userId,
+                latest
+              );
+            }
+          );
+
+          return;
+        }
+
+        // 卡片可能已经被删除
+        await withLocalLock(
+          `user-state:${userId}`,
+          async () => {
+
+            const latest =
+              await getState(
+                env,
+                userId
+              );
+
+            if (
+              String(
+                latest.thread_id
+              ) !==
+                String(userThreadId)
+            ) {
+              return;
+            }
+
+            delete latest.card_id;
+            delete latest.lastNotify;
+
+            await saveState(
+              env,
+              userId,
+              latest
+            );
+          }
+        );
+      }
+
+      // ------------------------------------------------------
+      // 创建新通知卡片
+      // ------------------------------------------------------
+
+      let res =
+        await tgCall(
+          env,
+          "sendMessage",
+          {
+            chat_id:
+              env.SUPERGROUP_ID,
+            message_thread_id:
+              Number(todoId),
+            text,
+            parse_mode:
+              "HTML",
+            reply_markup:
+              kb
+          }
+        );
+
+      // 汇总话题可能被删除
+      if (!res.ok) {
+
+        const currentTodo =
+          await env.TOPIC_MAP.get(
+            KEY.todoId
+          );
+
+        if (
+          currentTodo &&
+          String(currentTodo) ===
+            String(todoId)
+        ) {
+
+          await env.TOPIC_MAP.delete(
+            KEY.todoId
+          );
+        }
+
+        todoId =
+          await ensureTodoTopic(
+            env
+          );
+
+        if (!todoId) {
+          return;
+        }
+
+        res =
+          await tgCall(
+            env,
+            "sendMessage",
+            {
+              chat_id:
+                env.SUPERGROUP_ID,
+              message_thread_id:
+                Number(todoId),
+              text,
+              parse_mode:
+                "HTML",
+              reply_markup:
+                kb
+            }
+          );
+      }
+
+      if (!res.ok) {
+        return;
+      }
+
+      await withLocalLock(
+        `user-state:${userId}`,
+        async () => {
+
+          const latest =
+            await getState(
+              env,
+              userId
+            );
+
+          if (
+            !latest.thread_id ||
+            String(
+              latest.thread_id
+            ) !==
+              String(userThreadId)
+          ) {
+            return;
+          }
+
+          if (
+            sessionId &&
+            latest.sessionId &&
+            sessionId !==
+              latest.sessionId
+          ) {
+            return;
+          }
+
+          latest.card_id =
+            String(
+              res.result.message_id
+            );
+
+          latest.lastNotify =
+            now;
+
+          await saveState(
+            env,
+            userId,
+            latest
+          );
+        }
+      );
+    }
+  );
+}
+
+
+// ============================================================
+// 14. 管理员回复
+// ============================================================
+
+async function handleAdminReply(
+  msg,
+  env,
+  ctx
+) {
+
+  const tid =
+    String(
+      msg.message_thread_id
+    );
+
+  const todoId =
+    await env.TOPIC_MAP.get(
+      KEY.todoId
+    );
+
+  // 📬 新消息汇总话题
+  if (
+    todoId &&
+    String(tid) ===
+      String(todoId)
+  ) {
+    return;
   }
 
-  const name = [from.first_name, from.last_name].filter(Boolean).join(" ") || "用户";
-  const safeName = name.replace(/[<>]/g, "");
+  // 找用户
+  const uid =
+    await env.TOPIC_MAP.get(
+      KEY.thread(tid)
+    );
 
-  let text = `🎯 <b>新消息提醒</b>\n\n👤 <b>用户</b>: ${safeName}\n`;
-  if (from.username) text += `🆔 <b>账号</b>: @${from.username}\n`;
-  else text += `🆔 <b>ID</b>: <code>${userId}</code>\n`;
-  text += `💬 <b>内容</b>: ${preview.replace(/[<>]/g, "")}\n\n`;
-
-  const cardId = state.card_id;
-  if (cardId) {
-    text += `🔔 状态: [追加消息]`;
-  } else {
-    const adminMention = env.ADMIN_ID
-      ? `<a href="tg://user?id=${env.ADMIN_ID}">@管理员</a>`
-      : "<b>管理员</b>";
-    text += `📢 呼叫 ${adminMention} [待处理]`;
+  if (!uid) {
+    return;
   }
 
-  // 跳转链接
-  const cleanId = env.SUPERGROUP_ID.toString().replace("-100", "");
-  const jumpUrl = `https://t.me/c/${cleanId}/${lastId}?thread=${userThreadId}`;
+  // 管理员权限
+  const isAdmin =
+    !env.ADMIN_ID ||
+    String(msg.from?.id) ===
+      String(env.ADMIN_ID);
+
+  if (!isAdmin) {
+    return;
+  }
+
+  const cmd =
+    msg.text?.trim() || "";
+
+  // ----------------------------------------------------------
+  // /ban
+  // ----------------------------------------------------------
+
+  if (
+    /^\/ban\b/.test(cmd)
+  ) {
+
+    return withLocalLock(
+      `user-state:${uid}`,
+      async () => {
+
+        const state =
+          await getState(
+            env,
+            uid
+          );
+
+        state.ban =
+          true;
+
+        await saveState(
+          env,
+          uid,
+          state
+        );
+
+        return tgCall(
+          env,
+          "sendMessage",
+          {
+            chat_id:
+              env.SUPERGROUP_ID,
+            message_thread_id:
+              Number(tid),
+            text:
+              MSG.banned,
+            parse_mode:
+              "HTML"
+          }
+        );
+      }
+    );
+  }
+
+  // ----------------------------------------------------------
+  // /unban
+  // ----------------------------------------------------------
+
+  if (
+    /^\/unban\b/.test(cmd)
+  ) {
+
+    return withLocalLock(
+      `user-state:${uid}`,
+      async () => {
+
+        const state =
+          await getState(
+            env,
+            uid
+          );
+
+        delete state.ban;
+
+        await saveState(
+          env,
+          uid,
+          state
+        );
+
+        return tgCall(
+          env,
+          "sendMessage",
+          {
+            chat_id:
+              env.SUPERGROUP_ID,
+            message_thread_id:
+              Number(tid),
+            text:
+              MSG.unbanned,
+            parse_mode:
+              "HTML"
+          }
+        );
+      }
+    );
+  }
+
+  // ----------------------------------------------------------
+  // /close
+  // ----------------------------------------------------------
+
+  if (
+    /^\/close\b/.test(cmd)
+  ) {
+
+    return withLocalLock(
+      `user-state:${uid}`,
+      async () => {
+
+        const state =
+          await getState(
+            env,
+            uid
+          );
+
+        const name =
+          state.original_name ||
+          uid;
+
+        // 删除通知卡片
+        if (state.card_id) {
+
+          await tgCall(
+            env,
+            "deleteMessage",
+            {
+              chat_id:
+                env.SUPERGROUP_ID,
+              message_id:
+                Number(state.card_id)
+            }
+          );
+        }
+
+        // 修改话题名称
+        await tgCall(
+          env,
+          "editForumTopic",
+          {
+            chat_id:
+              env.SUPERGROUP_ID,
+            message_thread_id:
+              Number(tid),
+            name:
+              `[已结案] ${name}`
+                .substring(0, 60)
+          }
+        );
+
+        // 群内确认
+        await tgCall(
+          env,
+          "sendMessage",
+          {
+            chat_id:
+              env.SUPERGROUP_ID,
+            message_thread_id:
+              Number(tid),
+            text:
+              MSG.closedAdmin,
+            parse_mode:
+              "HTML"
+          }
+        );
+
+        // 关闭话题
+        const closeRes =
+          await tgCall(
+            env,
+            "closeForumTopic",
+            {
+              chat_id:
+                env.SUPERGROUP_ID,
+              message_thread_id:
+                Number(tid)
+            }
+          );
+
+        if (!closeRes.ok) {
+
+          await tgCall(
+            env,
+            "sendMessage",
+            {
+              chat_id:
+                env.SUPERGROUP_ID,
+              message_thread_id:
+                Number(tid),
+              text:
+                `⚠️ <b>关闭话题失败</b>\n\n${escapeHtml(closeRes.description || "未知错误")}`,
+              parse_mode:
+                "HTML"
+            }
+          );
+
+          return;
+        }
+
+        // 删除 KV
+        await Promise.all([
+
+          env.TOPIC_MAP.delete(
+            KEY.user(uid)
+          ),
+
+          env.TOPIC_MAP.delete(
+            KEY.thread(tid)
+          )
+        ]);
+
+        // 通知用户
+        await tgCall(
+          env,
+          "sendMessage",
+          {
+            chat_id:
+              uid,
+            text:
+              MSG.closed
+          }
+        );
+      }
+    );
+  }
+
+  // ----------------------------------------------------------
+  // /delete
+  // ----------------------------------------------------------
+
+  if (
+    /^\/delete\b/.test(cmd)
+  ) {
+
+    return withLocalLock(
+      `user-state:${uid}`,
+      async () => {
+
+        const state =
+          await getState(
+            env,
+            uid
+          );
+
+        // 删除通知卡片
+        if (state.card_id) {
+
+          await tgCall(
+            env,
+            "deleteMessage",
+            {
+              chat_id:
+                env.SUPERGROUP_ID,
+              message_id:
+                Number(state.card_id)
+            }
+          );
+        }
+
+        // 删除前提示
+        await tgCall(
+          env,
+          "sendMessage",
+          {
+            chat_id:
+              env.SUPERGROUP_ID,
+            message_thread_id:
+              Number(tid),
+            text:
+              MSG.deleted,
+            parse_mode:
+              "HTML"
+          }
+        );
+
+        // 删除 Telegram 话题
+        const delRes =
+          await tgCall(
+            env,
+            "deleteForumTopic",
+            {
+              chat_id:
+                env.SUPERGROUP_ID,
+              message_thread_id:
+                Number(tid)
+            }
+          );
+
+        // 删除失败
+        if (!delRes.ok) {
+
+          await tgCall(
+            env,
+            "sendMessage",
+            {
+              chat_id:
+                env.SUPERGROUP_ID,
+              message_thread_id:
+                Number(tid),
+              text:
+                `⚠️ <b>删除话题失败</b>\n` +
+                `原因：${escapeHtml(
+                  delRes.description ||
+                  "未知错误"
+                )}\n\n` +
+                `请检查机器人是否拥有「删除消息」权限。`,
+              parse_mode:
+                "HTML"
+            }
+          );
+
+          // 保留 KV
+          return;
+        }
+
+        // Telegram 删除成功
+        await Promise.all([
+
+          env.TOPIC_MAP.delete(
+            KEY.user(uid)
+          ),
+
+          env.TOPIC_MAP.delete(
+            KEY.thread(tid)
+          )
+        ]);
+
+        // 通知用户
+        await tgCall(
+          env,
+          "sendMessage",
+          {
+            chat_id:
+              uid,
+            text:
+              MSG.deletedUser
+          }
+        );
+      }
+    );
+  }
+
+  // ----------------------------------------------------------
+  // 用户端指令
+  // ----------------------------------------------------------
+
+  if (/^\//.test(cmd)) {
+
+    if (
+      /^\/start\b/.test(cmd)
+    ) {
+
+      return sendChallenge(
+        uid,
+        env
+      );
+    }
+
+    return tgCall(
+      env,
+      "sendMessage",
+      {
+        chat_id:
+          uid,
+        text:
+          MSG.noCmd,
+        parse_mode:
+          "HTML"
+      }
+    );
+  }
+
+  // ----------------------------------------------------------
+  // 普通管理员回复
+  // ----------------------------------------------------------
+
+  await withLocalLock(
+    `user-state:${uid}`,
+    async () => {
+
+      const state =
+        await getState(
+          env,
+          uid
+        );
+
+      // 删除通知卡片
+      if (state.card_id) {
+
+        await tgCall(
+          env,
+          "deleteMessage",
+          {
+            chat_id:
+              env.SUPERGROUP_ID,
+            message_id:
+              Number(state.card_id)
+          }
+        );
+
+        delete state.card_id;
+        delete state.lastNotify;
+      }
+
+      // 智能刷新验证
+      const now =
+        nowSec();
+
+      if (
+        !state.verifiedUntil ||
+        state.verifiedUntil <
+          now + 2 * 24 * 3600
+      ) {
+
+        state.verifiedUntil =
+          now + SEVEN_DAYS;
+      }
+
+      await saveState(
+        env,
+        uid,
+        state
+      );
+    }
+  );
+
+  // 转发管理员消息
+  await sendBot(
+    msg,
+    uid,
+    null,
+    env
+  );
+}
+
+
+// ============================================================
+// 15. 通用消息转发
+// ============================================================
+
+async function sendBot(
+  msg,
+  target,
+  thread,
+  env
+) {
+
+  const base = {
+    chat_id:
+      target
+  };
+
+  if (thread) {
+
+    base.message_thread_id =
+      Number(thread);
+  }
+
+  // 文本
+  if (msg.text) {
+
+    const body = {
+      ...base,
+      text:
+        msg.text
+    };
+
+    if (msg.entities) {
+
+      body.entities =
+        msg.entities;
+
+    }
+
+    return tgCall(
+      env,
+      "sendMessage",
+      body
+    );
+  }
+
+  // 图片
+  if (msg.photo) {
+
+    const body = {
+      ...base,
+      photo:
+        msg.photo[
+          msg.photo.length - 1
+        ].file_id,
+      caption:
+        msg.caption
+    };
+
+    if (msg.caption_entities) {
+
+      body.caption_entities =
+        msg.caption_entities;
+    }
+
+    return tgCall(
+      env,
+      "sendPhoto",
+      body
+    );
+  }
+
+  // 视频
+  if (msg.video) {
+
+    const body = {
+      ...base,
+      video:
+        msg.video.file_id,
+      caption:
+        msg.caption
+    };
+
+    if (msg.caption_entities) {
+
+      body.caption_entities =
+        msg.caption_entities;
+    }
+
+    return tgCall(
+      env,
+      "sendVideo",
+      body
+    );
+  }
+
+  // GIF
+  if (msg.animation) {
+
+    const body = {
+      ...base,
+      animation:
+        msg.animation.file_id,
+      caption:
+        msg.caption
+    };
+
+    if (msg.caption_entities) {
+
+      body.caption_entities =
+        msg.caption_entities;
+    }
+
+    return tgCall(
+      env,
+      "sendAnimation",
+      body
+    );
+  }
+
+  // 视频消息
+  if (msg.video_note) {
+
+    return tgCall(
+      env,
+      "sendVideoNote",
+      {
+        ...base,
+        video_note:
+          msg.video_note.file_id
+      }
+    );
+  }
+
+  // 贴纸
+  if (msg.sticker) {
+
+    return tgCall(
+      env,
+      "sendSticker",
+      {
+        ...base,
+        sticker:
+          msg.sticker.file_id
+      }
+    );
+  }
+
+  // 语音
+  if (msg.voice) {
+
+    return tgCall(
+      env,
+      "sendVoice",
+      {
+        ...base,
+        voice:
+          msg.voice.file_id,
+        caption:
+          msg.caption
+      }
+    );
+  }
+
+  // 音频
+  if (msg.audio) {
+
+    return tgCall(
+      env,
+      "sendAudio",
+      {
+        ...base,
+        audio:
+          msg.audio.file_id,
+        caption:
+          msg.caption,
+        caption_entities:
+          msg.caption_entities
+      }
+    );
+  }
+
+  // 文件
+  if (msg.document) {
+
+    return tgCall(
+      env,
+      "sendDocument",
+      {
+        ...base,
+        document:
+          msg.document.file_id,
+        caption:
+          msg.caption,
+        caption_entities:
+          msg.caption_entities
+      }
+    );
+  }
+
+  // 位置
+  if (msg.location) {
+
+    return tgCall(
+      env,
+      "sendLocation",
+      {
+        ...base,
+        latitude:
+          msg.location.latitude,
+        longitude:
+          msg.location.longitude
+      }
+    );
+  }
+
+  // 联系人
+  if (msg.contact) {
+
+    return tgCall(
+      env,
+      "sendContact",
+      {
+        ...base,
+        phone_number:
+          msg.contact.phone_number,
+        first_name:
+          msg.contact.first_name,
+        last_name:
+          msg.contact.last_name
+      }
+    );
+  }
+
+  return {
+    ok: false
+  };
+}
+
+
+// ============================================================
+// 16. Callback
+// ============================================================
+
+async function handleCallback(
+  query,
+  env
+) {
+
+  const data =
+    query.data || "";
+
+  const userId =
+    query.from.id;
+
+  // ----------------------------------------------------------
+  // 删除通知卡片
+  // ----------------------------------------------------------
+
+  if (
+    data.startsWith("del:")
+  ) {
+
+    const targetUid =
+      data.substring(4);
+
+    const isAdmin =
+      !env.ADMIN_ID ||
+      String(userId) ===
+        String(env.ADMIN_ID);
+
+    if (!isAdmin) {
+
+      await tgCall(
+        env,
+        "answerCallbackQuery",
+        {
+          callback_query_id:
+            query.id,
+          text:
+            "无权限",
+          show_alert:
+            true
+        }
+      );
+
+      return;
+    }
+
+    await withLocalLock(
+      `user-state:${targetUid}`,
+      async () => {
+
+        await tgCall(
+          env,
+          "deleteMessage",
+          {
+            chat_id:
+              env.SUPERGROUP_ID,
+            message_id:
+              query.message.message_id
+          }
+        );
+
+        const state =
+          await getState(
+            env,
+            targetUid
+          );
+
+        delete state.card_id;
+        delete state.lastNotify;
+
+        await saveState(
+          env,
+          targetUid,
+          state
+        );
+      }
+    );
+
+    await tgCall(
+      env,
+      "answerCallbackQuery",
+      {
+        callback_query_id:
+          query.id,
+        text:
+          "已忽略"
+      }
+    );
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // 验证题
+  // ----------------------------------------------------------
+
+  if (
+    data.startsWith("v:")
+  ) {
+
+    const parts =
+      data.split(":");
+
+    const cid =
+      parts[1];
+
+    const ans =
+      parts
+        .slice(2)
+        .join(":");
+
+    await withLocalLock(
+      `user-state:${userId}`,
+      async () => {
+
+        let state =
+          await getState(
+            env,
+            userId
+          );
+
+        const now =
+          nowSec();
+
+        // ----------------------------------------------------
+        // 已经临时封禁
+        // ----------------------------------------------------
+
+        if (
+          state.tempbanUntil &&
+          state.tempbanUntil > now
+        ) {
+
+          await tgCall(
+            env,
+            "answerCallbackQuery",
+            {
+              callback_query_id:
+                query.id,
+              text:
+                MSG.tempban,
+              show_alert:
+                true
+            }
+          );
+
+          return;
+        }
+
+        // ----------------------------------------------------
+        // 验证挑战
+        // ----------------------------------------------------
+
+        const validChallenge =
+          state.chalId === cid &&
+          state.chalUntil &&
+          state.chalUntil > now;
+
+        const correct =
+          validChallenge
+            ? state.chalAnswer
+            : null;
+
+        // 当前挑战只能使用一次
+        delete state.chalId;
+        delete state.chalAnswer;
+        delete state.chalUntil;
+
+        // ----------------------------------------------------
+        // 答对
+        // ----------------------------------------------------
+
+        if (
+          correct &&
+          ans === correct
+        ) {
+
+          state.verifiedUntil =
+            now + SEVEN_DAYS;
+
+          delete state.wrong;
+
+          await saveState(
+            env,
+            userId,
+            state
+          );
+
+          await tgCall(
+            env,
+            "editMessageText",
+            {
+              chat_id:
+                userId,
+              message_id:
+                query.message.message_id,
+              text:
+                "✅ <b>验证通过！</b>",
+              parse_mode:
+                "HTML"
+            }
+          );
+
+          await tgCall(
+            env,
+            "answerCallbackQuery",
+            {
+              callback_query_id:
+                query.id,
+              text:
+                "验证通过"
+            }
+          );
+
+          return;
+        }
+
+        // ----------------------------------------------------
+        // 挑战过期
+        // 不计入错误次数
+        // ----------------------------------------------------
+
+        if (!validChallenge) {
+
+          await saveState(
+            env,
+            userId,
+            state
+          );
+
+          await tgCall(
+            env,
+            "answerCallbackQuery",
+            {
+              callback_query_id:
+                query.id,
+              text:
+                "验证已过期，请重新发送 /start",
+              show_alert:
+                true
+            }
+          );
+
+          return;
+        }
+
+        // ----------------------------------------------------
+        // 答错
+        // ----------------------------------------------------
+
+        state.wrong =
+          (state.wrong || 0) + 1;
+
+        // ====================================================
+        // 重点：
+        //
+        // 连续答错 3 次
+        // ↓
+        // 禁止 30 分钟
+        // ====================================================
+
+        if (
+          state.wrong >= 3
+        ) {
+
+          state.tempbanUntil =
+            now + THIRTY_MIN;
+
+          // 封禁后清除错误次数
+          delete state.wrong;
+
+          // 同时清除当前验证题
+          delete state.chalId;
+          delete state.chalAnswer;
+          delete state.chalUntil;
+
+          await saveState(
+            env,
+            userId,
+            state
+          );
+
+          await tgCall(
+            env,
+            "editMessageText",
+            {
+              chat_id:
+                userId,
+              message_id:
+                query.message.message_id,
+              text:
+                MSG.tempban,
+              parse_mode:
+                "HTML"
+            }
+          );
+
+          await tgCall(
+            env,
+            "answerCallbackQuery",
+            {
+              callback_query_id:
+                query.id,
+              text:
+                "错误次数达到 3 次，已禁止 30 分钟",
+              show_alert:
+                true
+            }
+          );
+
+          return;
+        }
+
+        // ----------------------------------------------------
+        // 第 1 / 2 次错误
+        // ----------------------------------------------------
+
+        const wrongCount =
+          state.wrong;
+
+        await saveState(
+          env,
+          userId,
+          state
+        );
+
+        await tgCall(
+          env,
+          "answerCallbackQuery",
+          {
+            callback_query_id:
+              query.id,
+            text:
+              `❌ 验证失败，请重新回答 (错误 ${wrongCount}/3)`,
+            show_alert:
+              true
+          }
+        );
+
+        // ----------------------------------------------------
+        // 刷新下一道题
+        //
+        // 注意：
+        // 当前已经持有 user-state 锁，
+        // 所以这里必须使用 Locked 版本，
+        // 不能再次获取同一把锁。
+        // ----------------------------------------------------
+
+        await sendChallengeLocked(
+          userId,
+          env,
+          state,
+          query.message.message_id
+        );
+      }
+    );
+  }
+}
+
+
+// ============================================================
+// 17. 发送验证题
+//
+// 外部调用：
+//   sendChallenge()
+//
+// 已经处于 user-state 锁内部：
+//   sendChallengeLocked()
+//
+// 这样可以避免：
+//   A 请求拿旧 state
+//   B 请求已经修改 state
+//   A 再把旧 state 写回 KV
+// ============================================================
+
+async function sendChallenge(
+  uid,
+  env,
+  state = null,
+  editId = null
+) {
+
+  return withLocalLock(
+    `user-state:${uid}`,
+    async () => {
+
+      // 永远重新读取最新状态
+      const latestState =
+        await getState(
+          env,
+          uid
+        );
+
+      return sendChallengeLocked(
+        uid,
+        env,
+        latestState,
+        editId
+      );
+    }
+  );
+}
+
+
+// ============================================================
+// 18. 发送验证题 - 锁内部版本
+// ============================================================
+
+async function sendChallengeLocked(
+  uid,
+  env,
+  state,
+  editId = null
+) {
+
+  const now =
+    nowSec();
+
+  // ----------------------------------------------------------
+  // 临时封禁
+  // ----------------------------------------------------------
+
+  if (
+    state.tempbanUntil &&
+    state.tempbanUntil > now
+  ) {
+
+    const text =
+      MSG.tempban;
+
+    if (editId) {
+
+      await tgCall(
+        env,
+        "editMessageText",
+        {
+          chat_id:
+            uid,
+          message_id:
+            editId,
+          text,
+          parse_mode:
+            "HTML"
+        }
+      );
+
+    } else {
+
+      await tgCall(
+        env,
+        "sendMessage",
+        {
+          chat_id:
+            uid,
+          text,
+          parse_mode:
+            "HTML"
+        }
+      );
+    }
+
+    return;
+  }
+
+  // 已验证
+  if (
+    state.verifiedUntil &&
+    state.verifiedUntil > now
+  ) {
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // 如果已有有效挑战
+  // 不重复生成
+  // ----------------------------------------------------------
+
+  if (
+    state.chalId &&
+    state.chalUntil &&
+    state.chalUntil > now
+  ) {
+
+    if (editId) {
+      return;
+    }
+
+    return tgCall(
+      env,
+      "sendMessage",
+      {
+        chat_id:
+          uid,
+        text:
+          MSG.fail,
+        parse_mode:
+          "HTML"
+      }
+    );
+  }
+
+  // ----------------------------------------------------------
+  // 随机抽题
+  // ----------------------------------------------------------
+
+  const quiz =
+    QUESTION_BANK[
+      Math.floor(
+        Math.random() *
+        QUESTION_BANK.length
+      )
+    ];
+
+  const id =
+    crypto.randomUUID()
+      .replace(/-/g, "")
+      .substring(0, 12);
+
+  // ----------------------------------------------------------
+  // 保存挑战
+  // ----------------------------------------------------------
+
+  state.chalId =
+    id;
+
+  state.chalAnswer =
+    quiz.answer;
+
+  state.chalUntil =
+    now + FIVE_MIN;
+
+  await saveState(
+    env,
+    uid,
+    state
+  );
+
+  // ----------------------------------------------------------
+  // 按钮
+  // ----------------------------------------------------------
 
   const kb = {
+
     inline_keyboard: [
-      [
-        { text: "🚀 跳转话题", url: jumpUrl },
-        ...(from.username ? [{ text: "👤 资料", url: `https://t.me/${from.username}` }] : [])
-      ],
-      [{ text: "🗑️ 忽略卡片", callback_data: `del:${userId}` }]
+
+      quiz.options.map(
+        o => ({
+          text:
+            o,
+          callback_data:
+            `v:${id}:${o}`
+        })
+      )
+
     ]
   };
 
-  // 尝试编辑已有卡片
-  if (cardId) {
-    const edit = await tgCall(env, "editMessageText", {
-      chat_id: env.SUPERGROUP_ID,
-      message_id: Number(cardId),
-      text,
-      parse_mode: "HTML",
-      reply_markup: kb,
-      disable_notification: true
-    });
-    if (edit.ok) {
-      state.lastNotify = now;
-      await saveState(env, userId, state);
-      return;
-    }
-  }
+  const text =
+    "🛡 <b>身份验证</b>\n" +
+    "请选择正确答案以继续：\n\n" +
+    `问题：<b>${escapeHtml(
+      quiz.question
+    )}</b>`;
 
-  // 新建卡片
-  const res = await tgCall(env, "sendMessage", {
-    chat_id: env.SUPERGROUP_ID,
-    message_thread_id: todoId ? Number(todoId) : undefined,
-    text,
-    parse_mode: "HTML",
-    reply_markup: kb
-  });
-
-  if (res.ok) {
-    state.card_id = res.result.message_id.toString();
-    state.lastNotify = now;
-    await saveState(env, userId, state);
-  }
-}
-
-// ============================================================
-// 9. 处理管理员在话题中的回复
-// ============================================================
-async function handleAdminReply(msg, env, ctx) {
-  const tid = msg.message_thread_id.toString();
-
-  // 汇总话题内的消息不转发
-  if (tid === (await env.TOPIC_MAP.get(KEY.todoId))) return;
-
-  // 根据话题找到对应用户
-  const uid = await env.TOPIC_MAP.get(KEY.thread(tid));
-  if (!uid) return;
-
-  // 管理员权限校验
-  const isAdmin = !env.ADMIN_ID || String(msg.from.id) === String(env.ADMIN_ID);
-  if (!isAdmin) return;
-
-  const cmd = msg.text?.trim() || "";
-  let state = await getState(env, uid);
-  const now = nowSec();
-
-  // ---------- /ban 永久封禁 ----------
-  if (/^\/ban/.test(cmd)) {
-    state.ban = true;
-    await saveState(env, uid, state);
-    return tgCall(env, "sendMessage", {
-      chat_id: env.SUPERGROUP_ID,
-      message_thread_id: Number(tid),
-      text: MSG.banned,
-      parse_mode: "HTML"
-    });
-  }
-
-  // ---------- /unban 解封 ----------
-  if (/^\/unban/.test(cmd)) {
-    delete state.ban;
-    await saveState(env, uid, state);
-    return tgCall(env, "sendMessage", {
-      chat_id: env.SUPERGROUP_ID,
-      message_thread_id: Number(tid),
-      text: MSG.unbanned,
-      parse_mode: "HTML"
-    });
-  }
-
-  // ---------- /close 结案（彻底删除用户状态 + 通知卡片） ----------
-  if (/^\/close/.test(cmd)) {
-    const name = state.original_name || uid;
-
-    // 如果有未处理的通知卡片，先删掉
-    if (state.card_id) {
-      await tgCall(env, "deleteMessage", {
-        chat_id: env.SUPERGROUP_ID,
-        message_id: Number(state.card_id)
-      }).catch(() => {});
-    }
-
-    // 修改话题名称
-    await tgCall(env, "editForumTopic", {
-      chat_id: env.SUPERGROUP_ID,
-      message_thread_id: Number(tid),
-      name: `[已结案] ${name}`.substring(0, 60)
-    });
-
-    // 关闭话题
-    await tgCall(env, "closeForumTopic", {
-      chat_id: env.SUPERGROUP_ID,
-      message_thread_id: Number(tid)
-    }).catch(() => {});
-
-    // 彻底删除用户状态 + 话题映射（B 方案）
-    await Promise.all([
-      env.TOPIC_MAP.delete(KEY.user(uid)),
-      env.TOPIC_MAP.delete(KEY.thread(tid))
-    ]);
-
-    // 通知用户 + 群内确认
-    await tgCall(env, "sendMessage", { chat_id: uid, text: MSG.closed });
-    return tgCall(env, "sendMessage", {
-      chat_id: env.SUPERGROUP_ID,
-      message_thread_id: Number(tid),
-      text: MSG.closedAdmin,
-      parse_mode: "HTML"
-    });
-  }
-
-  // ---------- /delete 彻底删除话题（同时删除通知卡片） ----------
-  if (/^\/delete/.test(cmd)) {
-    // 1. 先通知用户
-    await tgCall(env, "sendMessage", {
-      chat_id: uid,
-      text: MSG.deletedUser
-    });
-
-    // 2. 如果有未处理的通知卡片，先删掉
-    if (state.card_id) {
-      await tgCall(env, "deleteMessage", {
-        chat_id: env.SUPERGROUP_ID,
-        message_id: Number(state.card_id)
-      }).catch(() => {});
-    }
-
-    // 3. 在话题内发送确认
-    await tgCall(env, "sendMessage", {
-      chat_id: env.SUPERGROUP_ID,
-      message_thread_id: Number(tid),
-      text: MSG.deleted,
-      parse_mode: "HTML"
-    });
-
-    // 4. 彻底删除用户状态 + 话题映射（B 方案）
-    await Promise.all([
-      env.TOPIC_MAP.delete(KEY.user(uid)),
-      env.TOPIC_MAP.delete(KEY.thread(tid))
-    ]);
-
-    // 5. 删除话题
-    const delRes = await tgCall(env, "deleteForumTopic", {
-      chat_id: env.SUPERGROUP_ID,
-      message_thread_id: Number(tid)
-    });
-
-    // 6. 删除失败时给出提示
-    if (!delRes.ok) {
-      await tgCall(env, "sendMessage", {
-        chat_id: env.SUPERGROUP_ID,
-        message_thread_id: Number(tid),
-        text: `⚠️ <b>删除话题失败</b>\n原因：${delRes.description || "未知错误"}\n\n请检查机器人是否拥有「删除消息」权限。`,
-        parse_mode: "HTML"
-      });
-    }
-
-    return;
-  }
-
-  // ---------- 屏蔽用户端指令 ----------
-  if (/^\//.test(cmd)) {
-    if (/^\/start/.test(cmd)) {
-      if (state.verifiedUntil && state.verifiedUntil > now) {
-        return tgCall(env, "sendMessage", {
-          chat_id: uid,
-          text: MSG.verified,
-          parse_mode: "HTML"
-        });
-      }
-    } else {
-      return tgCall(env, "sendMessage", {
-        chat_id: uid,
-        text: MSG.noCmd,
-        parse_mode: "HTML"
-      });
-    }
-  }
-
-  // ---------- 管理员开始回复 → 删除通知卡片 ----------
-  if (state.card_id) {
-    await tgCall(env, "deleteMessage", {
-      chat_id: env.SUPERGROUP_ID,
-      message_id: Number(state.card_id)
-    });
-    delete state.card_id;
-    delete state.lastNotify;
-  }
-
-  // 智能刷新验证有效期（只在快过期时写入，减少写操作）
-  if (!state.verifiedUntil || state.verifiedUntil < now + 2 * 24 * 3600) {
-    state.verifiedUntil = now + SEVEN_DAYS;
-  }
-  await saveState(env, uid, state);
-
-  // 转发管理员消息给用户
-  await sendBot(msg, uid, null, env);
-}
-
-// ============================================================
-// 10. 通用消息转发函数
-// ============================================================
-async function sendBot(msg, target, thread, env) {
-  const base = {
-    chat_id: target,
-    message_thread_id: thread ? Number(thread) : undefined
-  };
-
-  if (msg.text) {
-    return tgCall(env, "sendMessage", {
-      ...base,
-      text: msg.text,
-      entities: msg.entities,
-      parse_mode: msg.entities ? undefined : "HTML"
-    });
-  }
-  if (msg.photo) {
-    return tgCall(env, "sendPhoto", {
-      ...base,
-      photo: msg.photo[msg.photo.length - 1].file_id,
-      caption: msg.caption,
-      caption_entities: msg.caption_entities,
-      parse_mode: msg.caption_entities ? undefined : "HTML"
-    });
-  }
-  if (msg.video) {
-    return tgCall(env, "sendVideo", {
-      ...base,
-      video: msg.video.file_id,
-      caption: msg.caption,
-      caption_entities: msg.caption_entities,
-      parse_mode: msg.caption_entities ? undefined : "HTML"
-    });
-  }
-  if (msg.animation) {
-    return tgCall(env, "sendAnimation", {
-      ...base,
-      animation: msg.animation.file_id,
-      caption: msg.caption,
-      caption_entities: msg.caption_entities
-    });
-  }
-  if (msg.video_note) {
-    return tgCall(env, "sendVideoNote", {
-      ...base,
-      video_note: msg.video_note.file_id
-    });
-  }
-  if (msg.sticker) {
-    return tgCall(env, "sendSticker", {
-      ...base,
-      sticker: msg.sticker.file_id
-    });
-  }
-  if (msg.voice) {
-    return tgCall(env, "sendVoice", {
-      ...base,
-      voice: msg.voice.file_id,
-      caption: msg.caption
-    });
-  }
-  if (msg.audio) {
-    return tgCall(env, "sendAudio", {
-      ...base,
-      audio: msg.audio.file_id,
-      caption: msg.caption
-    });
-  }
-  if (msg.document) {
-    return tgCall(env, "sendDocument", {
-      ...base,
-      document: msg.document.file_id,
-      caption: msg.caption,
-      caption_entities: msg.caption_entities
-    });
-  }
-  if (msg.location) {
-    return tgCall(env, "sendLocation", {
-      ...base,
-      latitude: msg.location.latitude,
-      longitude: msg.location.longitude
-    });
-  }
-  if (msg.contact) {
-    return tgCall(env, "sendContact", {
-      ...base,
-      phone_number: msg.contact.phone_number,
-      first_name: msg.contact.first_name,
-      last_name: msg.contact.last_name
-    });
-  }
-
-  return { ok: false };
-}
-
-// ============================================================
-// 11. 处理按钮回调
-// ============================================================
-async function handleCallback(query, env) {
-  const data = query.data;
-  const userId = query.from.id;
-
-  // ---------- 删除通知卡片 ----------
-  if (data.startsWith("del:")) {
-    const targetUid = data.split(":")[1];
-    await tgCall(env, "deleteMessage", {
-      chat_id: env.SUPERGROUP_ID,
-      message_id: query.message.message_id
-    });
-
-    const state = await getState(env, targetUid);
-    delete state.card_id;
-    delete state.lastNotify;
-    await saveState(env, targetUid, state);
-    return;
-  }
-
-  // ---------- 验证题点击 ----------
-  if (data.startsWith("v:")) {
-    const [, cid, ans] = data.split(":");
-    let state = await getState(env, userId);
-    const now = nowSec();
-
-    // 取出正确答案并立即销毁本次挑战
-    const correct = (state.chalId === cid && state.chalUntil > now) ? state.chalAnswer : null;
-    delete state.chalId;
-    delete state.chalAnswer;
-    delete state.chalUntil;
-
-    // 检查临时封禁
-    if (state.tempbanUntil && state.tempbanUntil > now) {
-      await tgCall(env, "answerCallbackQuery", {
-        callback_query_id: query.id,
-        text: MSG.tempban,
-        show_alert: true
-      });
-      await saveState(env, userId, state);
-      return;
-    }
-
-    if (correct && ans === correct) {
-      // 验证成功
-      state.verifiedUntil = now + SEVEN_DAYS;
-      delete state.wrong;
-      await saveState(env, userId, state);
-
-      await tgCall(env, "editMessageText", {
-        chat_id: userId,
-        message_id: query.message.message_id,
-        text: "✅ <b>验证通过！</b>",
-        parse_mode: "HTML"
-      });
-    } else {
-      // 验证失败
-      state.wrong = (state.wrong || 0) + 1;
-
-      if (state.wrong >= 3) {
-        // 连续错误 3 次 → 临时封禁
-        state.tempbanUntil = now + THIRTY_MIN;
-        delete state.wrong;
-        await saveState(env, userId, state);
-
-        await tgCall(env, "editMessageText", {
-          chat_id: userId,
-          message_id: query.message.message_id,
-          text: MSG.tempban,
-          parse_mode: "HTML"
-        });
-      } else {
-        await saveState(env, userId, state);
-        await tgCall(env, "answerCallbackQuery", {
-          callback_query_id: query.id,
-          text: `❌ 验证失败，请重新回答 (错误 ${state.wrong}/3)`,
-          show_alert: true
-        });
-        // 刷新新题
-        await sendChallenge(userId, env, state, query.message.message_id);
-      }
-    }
-  }
-}
-
-// ============================================================
-// 12. 发送 / 刷新验证题
-// ============================================================
-async function sendChallenge(uid, env, state = null, editId = null) {
-  if (!state) state = await getState(env, uid);
-  const now = nowSec();
-
-  // 临时封禁检查
-  if (state.tempbanUntil && state.tempbanUntil > now) {
-    const text = MSG.tempban;
-    if (editId) {
-      await tgCall(env, "editMessageText", {
-        chat_id: uid,
-        message_id: editId,
-        text,
-        parse_mode: "HTML"
-      });
-    } else {
-      await tgCall(env, "sendMessage", {
-        chat_id: uid,
-        text,
-        parse_mode: "HTML"
-      });
-    }
-    return;
-  }
-
-  // 随机抽题
-  const quiz = QUESTION_BANK[Math.floor(Math.random() * QUESTION_BANK.length)];
-  const id = Math.random().toString(36).substring(2, 10);
-
-  // 把挑战数据写入用户状态
-  state.chalId = id;
-  state.chalAnswer = quiz.answer;
-  state.chalUntil = now + FIVE_MIN;
-  await saveState(env, uid, state);
-
-  const kb = {
-    inline_keyboard: [quiz.options.map(o => ({
-      text: o,
-      callback_data: `v:${id}:${o}`
-    }))]
-  };
-
-  const text = `🛡 <b>身份验证</b>\n请选择正确答案以继续：\n\n问题：<b>${quiz.question}</b>`;
+  // ----------------------------------------------------------
+  // 发送 / 编辑验证题
+  // ----------------------------------------------------------
 
   if (editId) {
-    await tgCall(env, "editMessageText", {
-      chat_id: uid,
-      message_id: editId,
-      text,
-      parse_mode: "HTML",
-      reply_markup: kb
-    });
+
+    await tgCall(
+      env,
+      "editMessageText",
+      {
+        chat_id:
+          uid,
+        message_id:
+          editId,
+        text,
+        parse_mode:
+          "HTML",
+        reply_markup:
+          kb
+      }
+    );
+
   } else {
-    await tgCall(env, "sendMessage", {
-      chat_id: uid,
-      text,
-      parse_mode: "HTML",
-      reply_markup: kb
-    });
+
+    await tgCall(
+      env,
+      "sendMessage",
+      {
+        chat_id:
+          uid,
+        text,
+        parse_mode:
+          "HTML",
+        reply_markup:
+          kb
+      }
+    );
   }
 }
 
+
 // ============================================================
-// 13. 生成消息预览（用于通知卡片）
+// 19. 消息预览
 // ============================================================
-function getPreview(msg) {
-  if (!msg) return "[未知消息]";
-  if (msg.text) return msg.text.substring(0, 30);
-  if (msg.sticker) return "📌 发送了贴纸 " + (msg.sticker.emoji || "");
-  if (msg.photo) return "🖼️ [图片消息]";
-  if (msg.video) return "🎬 [视频消息]";
-  if (msg.video_note) return "🎥 [视频通话消息]";
-  if (msg.animation) return "🎞️ [动画/GIF]";
-  if (msg.voice) return "🎤 [语音消息]";
-  if (msg.audio) return "🎵 [音频文件]";
-  if (msg.document) return "📄 [文件: " + (msg.document.file_name || "未知") + "]";
-  if (msg.location) return "📍 [位置消息]";
-  if (msg.venue) return "📍 [地点消息]";
-  if (msg.contact) return "📇 [联系人消息]";
-  if (msg.poll) return "🗳️ [投票消息]";
+
+function getPreview(
+  msg
+) {
+
+  if (!msg) {
+    return "[未知消息]";
+  }
+
+  if (msg.text) {
+    return msg.text.substring(
+      0,
+      30
+    );
+  }
+
+  if (msg.sticker) {
+
+    return (
+      "📌 发送了贴纸 " +
+      (msg.sticker.emoji || "")
+    );
+  }
+
+  if (msg.photo) {
+    return "🖼️ [图片消息]";
+  }
+
+  if (msg.video) {
+    return "🎬 [视频消息]";
+  }
+
+  if (msg.video_note) {
+    return "🎥 [视频消息]";
+  }
+
+  if (msg.animation) {
+    return "🎞️ [动画/GIF]";
+  }
+
+  if (msg.voice) {
+    return "🎤 [语音消息]";
+  }
+
+  if (msg.audio) {
+    return "🎵 [音频文件]";
+  }
+
+  if (msg.document) {
+
+    return (
+      "📄 [文件: " +
+      (
+        msg.document.file_name ||
+        "未知"
+      ) +
+      "]"
+    );
+  }
+
+  if (msg.location) {
+    return "📍 [位置消息]";
+  }
+
+  if (msg.venue) {
+    return "📍 [地点消息]";
+  }
+
+  if (msg.contact) {
+    return "📇 [联系人消息]";
+  }
+
+  if (msg.poll) {
+    return "🗳️ [投票消息]";
+  }
+
   return "[媒体消息]";
 }
 
-// ============================================================
-// 14. 注册 Webhook + 设置命令菜单
-// ============================================================
-async function handleRegisterWebhook(request, env) {
-  const domain = `https://${new URL(request.url).hostname}`;
 
-  // 设置 Webhook
-  await tgCall(env, "setWebhook", {
-    url: domain,
-    allowed_updates: ["message", "callback_query"],
-    drop_pending_updates: true
-  });
+// ============================================================
+// 20. 注册 Webhook
+// ============================================================
+
+async function handleRegisterWebhook(
+  request,
+  env
+) {
+
+  const domain =
+    `https://${new URL(request.url).hostname}`;
+
+  const webhook =
+    await tgCall(
+      env,
+      "setWebhook",
+      {
+        url:
+          domain,
+
+        allowed_updates:
+          [
+            "message",
+            "callback_query"
+          ],
+
+        drop_pending_updates:
+          true
+      }
+    );
 
   // 私聊菜单
-  await tgCall(env, "setMyCommands", {
-    scope: { type: "all_private_chats" },
-    commands: [
-      { command: "start", description: "开始咨询 / 激活机器人" }
-    ]
-  });
+  await tgCall(
+    env,
+    "setMyCommands",
+    {
+      scope: {
+        type:
+          "all_private_chats"
+      },
 
-  // 群组管理菜单
-  if (env.SUPERGROUP_ID) {
-    await tgCall(env, "setMyCommands", {
-      scope: { type: "chat", chat_id: env.SUPERGROUP_ID },
       commands: [
-        { command: "ban", description: "封禁当前话题用户" },
-        { command: "unban", description: "解封当前话题用户" },
-        { command: "close", description: "关闭当前话题用户" },
-        { command: "delete", description: "彻底删除当前话题（含消息）" }
+        {
+          command:
+            "start",
+          description:
+            "开始咨询 / 激活机器人"
+        }
       ]
-    });
+    }
+  );
+
+  // 群组菜单
+  if (
+    env.SUPERGROUP_ID
+  ) {
+
+    await tgCall(
+      env,
+      "setMyCommands",
+      {
+        scope: {
+          type:
+            "chat",
+          chat_id:
+            env.SUPERGROUP_ID
+        },
+
+        commands: [
+
+          {
+            command:
+              "ban",
+            description:
+              "封禁当前话题用户"
+          },
+
+          {
+            command:
+              "unban",
+            description:
+              "解封当前话题用户"
+          },
+
+          {
+            command:
+              "close",
+            description:
+              "关闭当前话题用户"
+          },
+
+          {
+            command:
+              "delete",
+            description:
+              "彻底删除当前话题（含消息）"
+          }
+        ]
+      }
+    );
   }
 
-  return new Response("Webhook & Commands Updated - Bot is Active");
+  return new Response(
+    webhook.ok
+      ? "Webhook & Commands Updated - Bot is Active"
+      : "Webhook update failed"
+  );
 }
 
-// ============================================================
-// 15. 清理旧版残留数据接口
-// 访问方式：https://你的域名/cleanup?key=你的密钥
-// 需要在环境变量中设置 CLEANUP_SECRET
-// ============================================================
-async function handleCleanup(request, env) {
-  const url = new URL(request.url);
-  const key = url.searchParams.get("key");
 
-  if (!env.CLEANUP_SECRET || key !== env.CLEANUP_SECRET) {
-    return new Response("Unauthorized", { status: 401 });
+// ============================================================
+// 21. 清理旧版 KV
+// ============================================================
+
+async function handleCleanup(
+  request,
+  env
+) {
+
+  const url =
+    new URL(request.url);
+
+  const key =
+    url.searchParams.get(
+      "key"
+    );
+
+  if (
+    !env.CLEANUP_SECRET ||
+    key !==
+      env.CLEANUP_SECRET
+  ) {
+
+    return new Response(
+      "Unauthorized",
+      {
+        status:
+          401
+      }
+    );
   }
 
-  let deleted = 0;
-  let cursor = undefined;
+  let deleted =
+    0;
 
-  // 旧版使用的 key 前缀
+  let cursor =
+    undefined;
+
   const oldPrefixes = [
-    "ban:", "v:", "u:", "c:", "chal:",
-    "user_chal:", "wrong_count:", "tempban:", "tip_lock:"
+
+    "ban:",
+    "v:",
+    "u:",
+    "c:",
+    "chal:",
+    "user_chal:",
+    "wrong_count:",
+    "tempban:",
+    "tip_lock:"
   ];
 
   do {
-    const list = await env.TOPIC_MAP.list({ limit: 1000, cursor });
-    for (const k of list.keys) {
-      if (oldPrefixes.some(p => k.name.startsWith(p))) {
-        await env.TOPIC_MAP.delete(k.name);
+
+    const list =
+      await env.TOPIC_MAP.list({
+        limit:
+          1000,
+        cursor
+      });
+
+    for (
+      const k of list.keys
+    ) {
+
+      if (
+        oldPrefixes.some(
+          p =>
+            k.name.startsWith(p)
+        )
+      ) {
+
+        await env.TOPIC_MAP.delete(
+          k.name
+        );
+
         deleted++;
       }
     }
-    cursor = list.list_complete ? undefined : list.cursor;
+
+    cursor =
+      list.list_complete
+        ? undefined
+        : list.cursor;
+
   } while (cursor);
 
-  return new Response(`Cleanup done. Deleted ${deleted} old keys.`);
+  return new Response(
+    `Cleanup done. Deleted ${deleted} old keys.`
+  );
 }
 
+
 // ============================================================
-// 16. Telegram API 调用封装
+// 22. Telegram API
 // ============================================================
-async function tgCall(env, method, body) {
+
+async function tgCall(
+  env,
+  method,
+  body
+) {
+
   try {
-    const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body)
-    });
-    const data = await r.json();
-    if (!data.ok) {
-      console.error(`[TG Error] ${method}`, JSON.stringify(data));
+
+    const controller =
+      new AbortController();
+
+    const timer =
+      setTimeout(
+        () =>
+          controller.abort(),
+        15000
+      );
+
+    let r;
+
+    try {
+
+      r =
+        await fetch(
+          `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,
+          {
+            method:
+              "POST",
+
+            headers: {
+              "content-type":
+                "application/json"
+            },
+
+            body:
+              JSON.stringify(body),
+
+            signal:
+              controller.signal
+          }
+        );
+
+    } finally {
+
+      clearTimeout(
+        timer
+      );
     }
+
+    const data =
+      await r.json();
+
+    if (!data.ok) {
+
+      console.error(
+        `[TG Error] ${method}`,
+        JSON.stringify(data)
+      );
+    }
+
     return data;
+
   } catch (e) {
-    console.error(`[Network Error] ${method}`, e);
-    return { ok: false };
+
+    console.error(
+      `[Network Error] ${method}`,
+      e
+    );
+
+    return {
+      ok:
+        false,
+
+      description:
+        String(e)
+    };
   }
 }
